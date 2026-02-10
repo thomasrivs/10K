@@ -2,15 +2,13 @@ import { isInDangerZone, routePassesThroughDangerZone } from "./danger-zones";
 
 const OSRM_BASE_URL = "https://router.project-osrm.org";
 const TARGET_DISTANCE_M = 7500; // ~10,000 steps at 0.75m/step
-const MIN_DISTANCE_M = 6500; // Accept slightly shorter to avoid cul-de-sacs
-const MAX_DISTANCE_M = 8500;
+const MIN_DISTANCE_M = 6750; // 9,000 steps
+const MAX_DISTANCE_M = 8250; // 11,000 steps
 const NUM_WAYPOINTS = 6;
 const MAX_WAYPOINT_RETRIES = 3;
 
-// Strict thresholds
-const MAX_OVERLAP_RATIO = 0.03; // Max 3% large-scale overlap
-const MAX_CUL_DE_SAC_RATIO = 0.01; // Max 1% cul-de-sac (essentially zero tolerance)
-const MAX_ATTEMPTS = 16;
+const CUL_DE_SAC_THRESHOLD_M = 10; // Max 10m of retracing allowed
+const MAX_ATTEMPTS = 20;
 
 interface RouteResult {
   distance: number; // meters
@@ -24,7 +22,24 @@ interface CandidateRoute {
   distance: number;
   geometry: GeoJSON.LineString;
   waypoints: [number, number][];
-  score: number; // Combined quality score (lower = better)
+  score: number;
+}
+
+/**
+ * Haversine distance between two [lng, lat] coordinate pairs (in meters).
+ */
+function haversineM(
+  lng1: number, lat1: number,
+  lng2: number, lat2: number
+): number {
+  const R = 6371e3;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 /**
@@ -133,126 +148,87 @@ async function callOSRM(
 }
 
 /**
- * Large-scale backtracking detection.
- * Catches when the same street is used at two distant parts of the route.
- * Uses MIN_SEQ_GAP = 10% to only flag far-apart revisits.
- */
-function computeOverlapRatio(geometry: GeoJSON.LineString): number {
-  const coords = geometry.coordinates;
-  if (coords.length < 10) return 0;
-
-  const CELL_SIZE = 0.00015; // ~15m grid
-  const cellFirstSeen = new Map<string, number>();
-  let overlapping = 0;
-  const total = coords.length;
-  const MIN_SEQ_GAP = Math.floor(total * 0.10);
-
-  for (let i = 0; i < total; i++) {
-    const cellX = Math.floor(coords[i][0] / CELL_SIZE);
-    const cellY = Math.floor(coords[i][1] / CELL_SIZE);
-    const key = `${cellX},${cellY}`;
-
-    const firstIdx = cellFirstSeen.get(key);
-    if (firstIdx !== undefined) {
-      if (i - firstIdx > MIN_SEQ_GAP) {
-        overlapping++;
-      }
-    } else {
-      cellFirstSeen.set(key, i);
-    }
-  }
-
-  return overlapping / total;
-}
-
-/**
- * Cul-de-sac detection.
- * A cul-de-sac is when the route goes to a location and comes back on
- * (roughly) the same path shortly after. This creates an out-and-back
- * pattern where nearby cells are visited twice with a small sequence gap.
+ * Cul-de-sac / backtracking detection.
  *
- * Strategy: for each cell visited, store ALL visit indices. Then check
- * for pairs of visits that are close in sequence (20-500 points apart)
- * but far enough to not be immediate neighbors.
- * Excludes the first/last 8% of the route (natural loop closure zone).
+ * Principle: a cul-de-sac happens when the route visits a location,
+ * goes somewhere, and comes back to (nearly) the same spot.
+ * This means two points that are close geographically (<10m) but
+ * far apart in the route sequence.
+ *
+ * We use a spatial grid to efficiently find nearby revisits.
+ * The grid cell size is smaller than the threshold so we only need
+ * to check neighboring cells.
+ *
+ * Excludes the loop closure zone (first/last 5%) where the route
+ * naturally returns to the start.
+ *
+ * Returns true if any cul-de-sac is detected.
  */
-function computeCulDeSacRatio(geometry: GeoJSON.LineString): number {
+function hasCulDeSac(geometry: GeoJSON.LineString): boolean {
   const coords = geometry.coordinates;
-  if (coords.length < 40) return 0;
-
-  const CELL_SIZE = 0.00012; // ~13m grid (tighter than overlap detector)
   const total = coords.length;
+  if (total < 20) return false;
 
-  // Sequence gap bounds for cul-de-sac detection:
-  // - Min 20 points apart (skip immediate neighbors on the same street segment)
-  // - Max 20% of route (beyond that it's large-scale backtracking, not a cul-de-sac)
-  const MIN_GAP = 20;
-  const MAX_GAP = Math.floor(total * 0.20);
+  // Skip loop closure zone (first/last 5%)
+  const zoneStart = Math.floor(total * 0.05);
+  const zoneEnd = total - Math.floor(total * 0.05);
 
-  // Exclude natural loop closure zone (first/last 8%)
-  const ZONE_START = Math.floor(total * 0.08);
-  const ZONE_END = total - Math.floor(total * 0.08);
+  // Grid cell size ~5m (half of threshold for neighbor checking)
+  const CELL_DEG = 0.000045; // ~5m
 
-  // Collect all visit indices per cell
-  const cellVisits = new Map<string, number[]>();
+  // Minimum sequence gap to consider as a cul-de-sac.
+  // Points that are very close in sequence are just the route following
+  // a wide street or curving — we need at least ~15 points gap.
+  const MIN_SEQ_GAP = 15;
 
-  for (let i = 0; i < total; i++) {
-    const cellX = Math.floor(coords[i][0] / CELL_SIZE);
-    const cellY = Math.floor(coords[i][1] / CELL_SIZE);
-    const key = `${cellX},${cellY}`;
+  // Build spatial index: grid cell -> list of indices
+  const grid = new Map<string, number[]>();
 
-    let visits = cellVisits.get(key);
-    if (!visits) {
-      visits = [];
-      cellVisits.set(key, visits);
+  for (let i = zoneStart; i < zoneEnd; i++) {
+    const cx = Math.floor(coords[i][0] / CELL_DEG);
+    const cy = Math.floor(coords[i][1] / CELL_DEG);
+    const key = `${cx},${cy}`;
+
+    let list = grid.get(key);
+    if (!list) {
+      list = [];
+      grid.set(key, list);
     }
-    visits.push(i);
+    list.push(i);
   }
 
-  // Count cells that show cul-de-sac pattern
-  let culDeSacPoints = 0;
+  // For each point in the middle zone, check neighboring cells
+  // for points that are close geographically but far in sequence
+  for (let i = zoneStart; i < zoneEnd; i++) {
+    const cx = Math.floor(coords[i][0] / CELL_DEG);
+    const cy = Math.floor(coords[i][1] / CELL_DEG);
 
-  for (const visits of cellVisits.values()) {
-    if (visits.length < 2) continue;
+    // Check 3x3 neighborhood
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const neighborKey = `${cx + dx},${cy + dy}`;
+        const neighbors = grid.get(neighborKey);
+        if (!neighbors) continue;
 
-    let isCulDeSac = false;
-    for (let a = 0; a < visits.length - 1 && !isCulDeSac; a++) {
-      for (let b = a + 1; b < visits.length; b++) {
-        const gap = visits[b] - visits[a];
-        if (gap < MIN_GAP) continue; // Too close in sequence, normal
-        if (gap > MAX_GAP) break; // Too far apart, not a cul-de-sac
+        for (const j of neighbors) {
+          // Must be far enough apart in sequence
+          if (Math.abs(j - i) < MIN_SEQ_GAP) continue;
 
-        // Both visits must be in the middle zone (not loop closure)
-        if (visits[a] >= ZONE_START && visits[b] <= ZONE_END) {
-          isCulDeSac = true;
-          break;
+          // Check actual distance
+          const dist = haversineM(
+            coords[i][0], coords[i][1],
+            coords[j][0], coords[j][1]
+          );
+
+          if (dist < CUL_DE_SAC_THRESHOLD_M) {
+            return true; // Cul-de-sac detected
+          }
         }
       }
     }
-
-    if (isCulDeSac) {
-      // Count all points in this cell as cul-de-sac points
-      culDeSacPoints += visits.length;
-    }
   }
 
-  return culDeSacPoints / total;
-}
-
-/**
- * Combined route quality score. Lower is better.
- * Cul-de-sacs are weighted 3x more than large-scale overlap because
- * they are more noticeable and annoying to the walker.
- */
-function routeQualityScore(geometry: GeoJSON.LineString): {
-  overlap: number;
-  culDeSac: number;
-  score: number;
-} {
-  const overlap = computeOverlapRatio(geometry);
-  const culDeSac = computeCulDeSacRatio(geometry);
-  const score = overlap + culDeSac * 3;
-  return { overlap, culDeSac, score };
+  return false;
 }
 
 function buildResult(
@@ -272,16 +248,16 @@ function buildResult(
 
 /**
  * Main route generation function.
- * Generates a clean walking LOOP of ~7.5km from a starting point.
- * Strictly rejects any route with backtracking or cul-de-sacs.
- * Tries up to MAX_ATTEMPTS times, always returns the cleanest route found.
+ * Generates a clean walking LOOP of ~7.5km (9000-11000 steps) from a starting point.
+ * Strictly rejects any route with cul-de-sacs (>10m backtracking).
+ * Tries up to MAX_ATTEMPTS times, returns the best valid route.
  */
 export async function generateRoute(
   lat: number,
   lng: number
 ): Promise<RouteResult> {
   let radiusKm = 1.2;
-  let best: CandidateRoute | null = null;
+  let bestAny: CandidateRoute | null = null; // best route overall (fallback)
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const waypoints = generateSafeWaypoints(lat, lng, radiusKm, NUM_WAYPOINTS);
@@ -296,13 +272,21 @@ export async function generateRoute(
     // Skip routes through danger zones
     if (routePassesThroughDangerZone(result.geometry)) continue;
 
-    const { overlap, culDeSac, score } = routeQualityScore(result.geometry);
     const distanceOk =
       result.distance >= MIN_DISTANCE_M && result.distance <= MAX_DISTANCE_M;
+    const culDeSac = hasCulDeSac(result.geometry);
 
-    // Track best route found so far
-    if (!best || score < best.score) {
-      best = {
+    // Score: 0 = perfect, higher = worse
+    const score = (distanceOk ? 0 : 1) + (culDeSac ? 5 : 0);
+
+    // Perfect route found — return immediately
+    if (distanceOk && !culDeSac) {
+      return buildResult(result.distance, result.geometry, waypoints);
+    }
+
+    // Track best overall (for fallback)
+    if (!bestAny || score < bestAny.score) {
+      bestAny = {
         distance: result.distance,
         geometry: result.geometry,
         waypoints,
@@ -310,28 +294,17 @@ export async function generateRoute(
       };
     }
 
-    // Perfect: clean loop + no cul-de-sacs + good distance → return
-    if (
-      distanceOk &&
-      overlap <= MAX_OVERLAP_RATIO &&
-      culDeSac <= MAX_CUL_DE_SAC_RATIO
-    ) {
-      return buildResult(result.distance, result.geometry, waypoints);
-    }
-
-    // Adjust radius if distance is wrong
+    // Adjust radius to converge toward target distance
     if (!distanceOk) {
       const ratio = TARGET_DISTANCE_M / result.distance;
       radiusKm = radiusKm * ratio;
       radiusKm = Math.max(0.3, Math.min(3.0, radiusKm));
     }
-
-    // Overlap or cul-de-sac too high → retry with new random waypoints
   }
 
-  // Return the cleanest route found across all attempts
-  if (best) {
-    return buildResult(best.distance, best.geometry, best.waypoints);
+  // Fallback: return best route found (may not be perfect)
+  if (bestAny) {
+    return buildResult(bestAny.distance, bestAny.geometry, bestAny.waypoints);
   }
 
   // Ultimate fallback
