@@ -70,15 +70,19 @@ const startIcon = new L.DivIcon({
   className: "",
 });
 
-const liveIcon = new L.DivIcon({
-  html: `<div style="position:relative;width:28px;height:28px">
-    <div style="position:absolute;inset:0;background:#00f5d4;border-radius:50%;opacity:0.25;animation:pulse-ring 1.5s cubic-bezier(0.215,0.61,0.355,1) infinite"></div>
-    <div style="position:absolute;inset:4px;background:#00f5d4;border-radius:50%;border:3px solid #1a1a2e;box-shadow:0 0 16px rgba(0,245,212,0.6)"></div>
-  </div>`,
-  iconSize: [28, 28],
-  iconAnchor: [14, 14],
-  className: "",
-});
+function createNavIcon(heading: number): L.DivIcon {
+  return new L.DivIcon({
+    html: `<div style="position:relative;width:44px;height:44px;transform:rotate(${heading}deg)">
+      <div style="position:absolute;inset:0;background:rgba(0,245,212,0.15);border-radius:50%;animation:pulse-ring 2s ease-out infinite"></div>
+      <svg style="position:absolute;inset:2px" width="40" height="40" viewBox="0 0 40 40">
+        <polygon points="20,4 30,32 20,25 10,32" fill="#00f5d4" stroke="#1a1a2e" stroke-width="2" stroke-linejoin="round" style="filter:drop-shadow(0 0 6px rgba(0,245,212,0.5))"/>
+      </svg>
+    </div>`,
+    iconSize: [44, 44],
+    iconAnchor: [22, 22],
+    className: "",
+  });
+}
 
 // ─── Map helpers ─────────────────────────────────────────────
 
@@ -90,11 +94,17 @@ function FlyToPosition({ position }: { position: [number, number] }) {
   return null;
 }
 
-function FollowUser({ position }: { position: [number, number] }) {
+function FollowUser({ position, initialZoom }: { position: [number, number]; initialZoom?: number }) {
   const map = useMap();
+  const isFirstRef = useRef(true);
   useEffect(() => {
-    map.setView(position, map.getZoom(), { animate: true });
-  }, [map, position]);
+    if (isFirstRef.current && initialZoom) {
+      map.flyTo(position, initialZoom, { duration: 1.2 });
+      isFirstRef.current = false;
+    } else {
+      map.setView(position, map.getZoom(), { animate: true });
+    }
+  }, [map, position, initialZoom]);
   return null;
 }
 
@@ -109,6 +119,15 @@ function FitRouteBounds({ geometry }: { geometry: GeoJSON.LineString }) {
       map.fitBounds(bounds, { padding: [60, 60] });
     }
   }, [map, geometry]);
+  return null;
+}
+
+function ResizeMap({ active }: { active: boolean }) {
+  const map = useMap();
+  useEffect(() => {
+    const timer = setTimeout(() => map.invalidateSize(), 50);
+    return () => clearTimeout(timer);
+  }, [map, active]);
   return null;
 }
 
@@ -289,6 +308,7 @@ export default function Map() {
   const [trackingTime, setTrackingTime] = useState(0);
   const [gpsLost, setGpsLost] = useState(false);
   const [showCongrats, setShowCongrats] = useState(false);
+  const [mapRotation, setMapRotation] = useState(0);
   const watchIdRef = useRef<number | null>(null);
   const lastPosRef = useRef<[number, number] | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -425,6 +445,7 @@ export default function Map() {
     setWalkedDistance(0);
     setTrackingTime(0);
     setGpsLost(false);
+    setMapRotation(0);
     lastPosRef.current = userPosition;
     setLivePosition(userPosition);
 
@@ -446,6 +467,20 @@ export default function Map() {
           const d = distanceBetween(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
           if (d > 3 && d < 100) {
             setWalkedDistance((prev) => prev + d);
+            // Compute heading from GPS or movement direction
+            let h = pos.coords.heading;
+            if (h === null || h === undefined || isNaN(h)) {
+              h = bearing(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
+            }
+            if (typeof h === "number" && !isNaN(h)) {
+              setMapRotation((prev) => {
+                const prevMod = ((prev % 360) + 360) % 360;
+                let delta = h - prevMod;
+                if (delta > 180) delta -= 360;
+                if (delta < -180) delta += 360;
+                return prev + delta;
+              });
+            }
           }
         }
         lastPosRef.current = newPos;
@@ -475,6 +510,19 @@ export default function Map() {
           const d = distanceBetween(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
           if (d > 3 && d < 100) {
             setWalkedDistance((prev) => prev + d);
+            let h = pos.coords.heading;
+            if (h === null || h === undefined || isNaN(h)) {
+              h = bearing(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
+            }
+            if (typeof h === "number" && !isNaN(h)) {
+              setMapRotation((prev) => {
+                const prevMod = ((prev % 360) + 360) % 360;
+                let delta = h - prevMod;
+                if (delta > 180) delta -= 360;
+                if (delta < -180) delta += 360;
+                return prev + delta;
+              });
+            }
           }
         }
         lastPosRef.current = newPos;
@@ -581,8 +629,17 @@ export default function Map() {
   const activeGeometry = routeData?.geometry ?? viewingHistory?.geometry ?? null;
 
   return (
-    <div className="relative h-full w-full">
-      {/* ─── Map ─────────────────────────────────────── */}
+    <div className="relative h-full w-full overflow-hidden">
+      {/* ─── Map (rotation wrapper for navigation mode) ── */}
+      <div
+        style={{
+          position: "absolute",
+          inset: isTracking ? "-25%" : "0",
+          transform: isTracking ? `rotate(${-mapRotation}deg)` : "rotate(0deg)",
+          transition: isTracking ? "transform 0.3s ease-out" : "none",
+          transformOrigin: "center center",
+        }}
+      >
       <MapContainer
         center={DEFAULT_CENTER}
         zoom={DEFAULT_ZOOM}
@@ -600,7 +657,7 @@ export default function Map() {
         )}
 
         {/* Follow user during tracking */}
-        {isTracking && livePosition && <FollowUser position={livePosition} />}
+        {isTracking && livePosition && <FollowUser position={livePosition} initialZoom={17} />}
 
         {/* User position circle (before route) */}
         {userPosition && !routeData && !isTracking && (
@@ -625,10 +682,12 @@ export default function Map() {
           </Marker>
         )}
 
-        {/* Live tracking marker */}
+        {/* Live tracking marker with direction arrow */}
         {isTracking && livePosition && (
-          <Marker position={livePosition} icon={liveIcon} />
+          <Marker position={livePosition} icon={createNavIcon(((mapRotation % 360) + 360) % 360)} />
         )}
+
+        <ResizeMap active={isTracking} />
 
         {/* Route display */}
         {activeGeometry && (
@@ -639,6 +698,7 @@ export default function Map() {
           </>
         )}
       </MapContainer>
+      </div>
 
       {/* ─── Route info panel ────────────────────────── */}
       {routeData && !isTracking && (
