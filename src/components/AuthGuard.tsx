@@ -41,7 +41,7 @@ export default function AuthGuard({ children }: { children: (user: User) => Reac
     return (
       <div className="flex h-dvh flex-col items-center justify-center bg-dark-base">
         <h1 className="text-gradient mb-6 font-[family-name:var(--font-montserrat)] text-4xl font-extrabold">
-          MyApp
+          10K
         </h1>
         <div className="spinner" />
       </div>

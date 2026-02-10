@@ -36,7 +36,7 @@ export default function LoginPage() {
     <div className="h-dvh flex items-center justify-center bg-dark-base px-4">
       <div className="animate-fade-in-up w-full max-w-sm">
         <h1 className="text-gradient mb-1 text-center font-[family-name:var(--font-montserrat)] text-3xl font-extrabold">
-          MyApp
+          10K
         </h1>
         <p className="mb-8 text-center text-sm text-text-secondary">
           Connectez-vous pour générer vos parcours
