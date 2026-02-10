@@ -1,0 +1,62 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Zone exemple - Porte de la Chapelle",
+        "source": "manual"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [2.3550, 48.8970],
+            [2.3620, 48.8970],
+            [2.3620, 48.8930],
+            [2.3550, 48.8930],
+            [2.3550, 48.8970]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Zone exemple - Stalingrad",
+        "source": "manual"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [2.3650, 48.8840],
+            [2.3720, 48.8840],
+            [2.3720, 48.8800],
+            [2.3650, 48.8800],
+            [2.3650, 48.8840]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Zone exemple - Gare du Nord (abords)",
+        "source": "manual"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [2.3510, 48.8830],
+            [2.3580, 48.8830],
+            [2.3580, 48.8790],
+            [2.3510, 48.8790],
+            [2.3510, 48.8830]
+          ]
+        ]
+      }
+    }
+  ]
+}
