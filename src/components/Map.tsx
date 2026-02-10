@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -19,6 +19,8 @@ import { useRouter } from "next/navigation";
 
 const DEFAULT_CENTER: [number, number] = [48.8566, 2.3522];
 const DEFAULT_ZOOM = 14;
+const ARRIVAL_DISTANCE_M = 50;
+const ARRIVAL_PROGRESS_RATIO = 0.8;
 
 // ─── Types ───────────────────────────────────────────────────
 
@@ -27,7 +29,9 @@ type AppMode =
   | "locating"
   | "positioned"
   | "generating"
-  | "route_shown";
+  | "route_shown"
+  | "tracking"
+  | "paused";
 
 interface RouteData {
   id: string | null;
@@ -37,6 +41,21 @@ interface RouteData {
   geometry: GeoJSON.LineString;
   routes_used: number;
   routes_limit: number;
+}
+
+interface HistoryRoute {
+  id: string;
+  start_lat: number;
+  start_lng: number;
+  distance_m: number;
+  steps_estimate: number;
+  duration_s: number | null;
+  geometry: GeoJSON.LineString | null;
+  status: string;
+  walked_distance_m: number | null;
+  walked_duration_s: number | null;
+  completed_at: string | null;
+  created_at: string;
 }
 
 // ─── Icons ───────────────────────────────────────────────────
@@ -51,12 +70,30 @@ const startIcon = new L.DivIcon({
   className: "",
 });
 
+const liveIcon = new L.DivIcon({
+  html: `<div style="position:relative;width:28px;height:28px">
+    <div style="position:absolute;inset:0;background:#00f5d4;border-radius:50%;opacity:0.25;animation:pulse-ring 1.5s cubic-bezier(0.215,0.61,0.355,1) infinite"></div>
+    <div style="position:absolute;inset:4px;background:#00f5d4;border-radius:50%;border:3px solid #1a1a2e;box-shadow:0 0 16px rgba(0,245,212,0.6)"></div>
+  </div>`,
+  iconSize: [28, 28],
+  iconAnchor: [14, 14],
+  className: "",
+});
+
 // ─── Map helpers ─────────────────────────────────────────────
 
 function FlyToPosition({ position }: { position: [number, number] }) {
   const map = useMap();
   useEffect(() => {
     map.flyTo(position, 15);
+  }, [map, position]);
+  return null;
+}
+
+function FollowUser({ position }: { position: [number, number] }) {
+  const map = useMap();
+  useEffect(() => {
+    map.setView(position, map.getZoom(), { animate: true });
   }, [map, position]);
   return null;
 }
@@ -186,18 +223,114 @@ function formatDuration(seconds: number): string {
   return `${minutes} min`;
 }
 
+function formatTrackingTime(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0)
+    return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+}
+
+function distanceBetween(
+  lat1: number,
+  lng1: number,
+  lat2: number,
+  lng2: number
+): number {
+  const R = 6371e3;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleDateString("fr-FR", {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function statusBadge(status: string) {
+  const map: Record<string, { label: string; cls: string }> = {
+    generated: { label: "Généré", cls: "bg-dark-border text-text-secondary" },
+    in_progress: { label: "En cours", cls: "bg-accent-cyan/20 text-accent-cyan" },
+    completed: { label: "Terminé", cls: "bg-accent-green/20 text-accent-green" },
+    abandoned: { label: "Abandonné", cls: "bg-accent-red/20 text-accent-red" },
+  };
+  const s = map[status] ?? map.generated;
+  return (
+    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${s.cls}`}>
+      {s.label}
+    </span>
+  );
+}
+
 // ─── Main Component ──────────────────────────────────────────
 
 export default function Map() {
   const [appMode, setAppMode] = useState<AppMode>("idle");
   const [userPosition, setUserPosition] = useState<[number, number] | null>(null);
+  const [livePosition, setLivePosition] = useState<[number, number] | null>(null);
   const [geoError, setGeoError] = useState<string | null>(null);
   const [routeData, setRouteData] = useState<RouteData | null>(null);
   const [routeError, setRouteError] = useState<string | null>(null);
   const [limitReached, setLimitReached] = useState(false);
 
+  // Tracking state
+  const [walkedDistance, setWalkedDistance] = useState(0);
+  const [trackingTime, setTrackingTime] = useState(0);
+  const [gpsLost, setGpsLost] = useState(false);
+  const [showCongrats, setShowCongrats] = useState(false);
+  const watchIdRef = useRef<number | null>(null);
+  const lastPosRef = useRef<[number, number] | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // History state
+  const [showHistory, setShowHistory] = useState(false);
+  const [historyRoutes, setHistoryRoutes] = useState<HistoryRoute[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [viewingHistory, setViewingHistory] = useState<HistoryRoute | null>(null);
+
   const supabase = createClient();
   const router = useRouter();
+
+  // ─── Cleanup on unmount ─────────────────────────────────
+  useEffect(() => {
+    return () => {
+      if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current);
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, []);
+
+  // ─── Tracking timer ─────────────────────────────────────
+  useEffect(() => {
+    if (appMode === "tracking") {
+      timerRef.current = setInterval(() => {
+        setTrackingTime((t) => t + 1);
+      }, 1000);
+    } else if (appMode !== "paused") {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    }
+    // Pause: just stop the interval, keep the time
+    if (appMode === "paused" && timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [appMode]);
 
   // ─── Auth ───────────────────────────────────────────────
   const handleLogout = async () => {
@@ -246,6 +379,7 @@ export default function Map() {
     setRouteError(null);
     setRouteData(null);
     setLimitReached(false);
+    setViewingHistory(null);
 
     try {
       const res = await fetch("/api/route", {
@@ -272,16 +406,174 @@ export default function Map() {
     }
   };
 
+  // ─── GPS Tracking ──────────────────────────────────────
+  const checkArrival = useCallback(
+    (pos: [number, number]) => {
+      if (!userPosition || !routeData) return;
+      const distToStart = distanceBetween(pos[0], pos[1], userPosition[0], userPosition[1]);
+      if (distToStart < ARRIVAL_DISTANCE_M && walkedDistance > routeData.distance_m * ARRIVAL_PROGRESS_RATIO) {
+        stopTracking("completed");
+        setShowCongrats(true);
+      }
+    },
+    [userPosition, routeData, walkedDistance]
+  );
+
+  const startTracking = useCallback(() => {
+    if (!routeData || !userPosition) return;
+    setAppMode("tracking");
+    setWalkedDistance(0);
+    setTrackingTime(0);
+    setGpsLost(false);
+    lastPosRef.current = userPosition;
+    setLivePosition(userPosition);
+
+    // Update route status to in_progress
+    if (routeData.id) {
+      fetch(`/api/route/${routeData.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "in_progress" }),
+      }).catch(() => {});
+    }
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const newPos: [number, number] = [pos.coords.latitude, pos.coords.longitude];
+        setGpsLost(false);
+        setLivePosition(newPos);
+        if (lastPosRef.current) {
+          const d = distanceBetween(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
+          if (d > 3 && d < 100) {
+            setWalkedDistance((prev) => prev + d);
+          }
+        }
+        lastPosRef.current = newPos;
+        checkArrival(newPos);
+      },
+      () => setGpsLost(true),
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
+    );
+  }, [routeData, userPosition, checkArrival]);
+
+  const pauseTracking = () => {
+    if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+    setAppMode("paused");
+  };
+
+  const resumeTracking = () => {
+    setAppMode("tracking");
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const newPos: [number, number] = [pos.coords.latitude, pos.coords.longitude];
+        setGpsLost(false);
+        setLivePosition(newPos);
+        if (lastPosRef.current) {
+          const d = distanceBetween(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
+          if (d > 3 && d < 100) {
+            setWalkedDistance((prev) => prev + d);
+          }
+        }
+        lastPosRef.current = newPos;
+        checkArrival(newPos);
+      },
+      () => setGpsLost(true),
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
+    );
+  };
+
+  const stopTracking = useCallback(
+    (status: "completed" | "abandoned") => {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+
+      // Save to DB
+      if (routeData?.id) {
+        fetch(`/api/route/${routeData.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            status,
+            walked_distance_m: walkedDistance,
+            walked_duration_s: trackingTime,
+          }),
+        }).catch(() => {});
+      }
+
+      setAppMode("route_shown");
+    },
+    [routeData, walkedDistance, trackingTime]
+  );
+
+  // ─── History ────────────────────────────────────────────
+  const loadHistory = async () => {
+    setHistoryLoading(true);
+    try {
+      const res = await fetch("/api/history");
+      const data = await res.json();
+      if (res.ok) setHistoryRoutes(data.routes ?? []);
+    } catch {
+      // silent
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const toggleHistory = () => {
+    if (!showHistory) loadHistory();
+    setShowHistory(!showHistory);
+  };
+
+  const viewHistoryRoute = (route: HistoryRoute) => {
+    setViewingHistory(route);
+    setShowHistory(false);
+    if (route.geometry) {
+      setRouteData({
+        id: route.id,
+        distance_m: route.distance_m,
+        duration_s: route.duration_s ?? 0,
+        steps_estimate: route.steps_estimate,
+        geometry: route.geometry,
+        routes_used: 0,
+        routes_limit: 0,
+      });
+      setUserPosition([route.start_lat, route.start_lng]);
+      setAppMode("route_shown");
+    }
+  };
+
+  const redoRoute = (route: HistoryRoute) => {
+    setShowHistory(false);
+    setViewingHistory(null);
+    setUserPosition([route.start_lat, route.start_lng]);
+    setAppMode("positioned");
+    setTimeout(() => generateRoute(), 100);
+  };
+
   // ─── Main action handler ───────────────────────────────
   const handleMainAction = () => {
     if (appMode === "idle") {
       requestLocation();
     } else if (appMode === "positioned") {
       generateRoute();
-    } else if (appMode === "route_shown") {
+    } else if (appMode === "route_shown" && !viewingHistory) {
       generateRoute();
     }
   };
+
+  // ─── Computed values ───────────────────────────────────
+  const isTracking = appMode === "tracking" || appMode === "paused";
+  const remainingDistance = routeData ? Math.max(0, routeData.distance_m - walkedDistance) : 0;
+  const activeGeometry = routeData?.geometry ?? viewingHistory?.geometry ?? null;
 
   return (
     <div className="relative h-full w-full">
@@ -296,13 +588,16 @@ export default function Map() {
           url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
         />
 
-        {/* Fly to user position */}
-        {userPosition && !routeData && (
+        {/* Fly to user position (not during tracking) */}
+        {userPosition && !routeData && !isTracking && (
           <FlyToPosition position={userPosition} />
         )}
 
+        {/* Follow user during tracking */}
+        {isTracking && livePosition && <FollowUser position={livePosition} />}
+
         {/* User position circle (before route) */}
-        {userPosition && !routeData && (
+        {userPosition && !routeData && !isTracking && (
           <CircleMarker
             center={userPosition}
             radius={10}
@@ -318,24 +613,29 @@ export default function Map() {
         )}
 
         {/* Start marker (with route) */}
-        {userPosition && routeData && (
+        {userPosition && routeData && !isTracking && (
           <Marker position={userPosition} icon={startIcon}>
             <Popup>Départ / Arrivée</Popup>
           </Marker>
         )}
 
+        {/* Live tracking marker */}
+        {isTracking && livePosition && (
+          <Marker position={livePosition} icon={liveIcon} />
+        )}
+
         {/* Route display */}
-        {routeData?.geometry && (
+        {activeGeometry && (
           <>
-            <GradientRoute geometry={routeData.geometry} />
-            <RouteArrows geometry={routeData.geometry} />
-            <FitRouteBounds geometry={routeData.geometry} />
+            <GradientRoute geometry={activeGeometry} />
+            <RouteArrows geometry={activeGeometry} />
+            {!isTracking && <FitRouteBounds geometry={activeGeometry} />}
           </>
         )}
       </MapContainer>
 
       {/* ─── Route info panel ────────────────────────── */}
-      {routeData && (
+      {routeData && !isTracking && (
         <div className="glass-card animate-fade-in-up safe-top absolute top-4 left-1/2 z-[1000] w-[90%] max-w-sm -translate-x-1/2 px-4 py-3">
           <div className="flex items-center justify-center gap-3 font-[family-name:var(--font-montserrat)] text-sm font-semibold">
             <div className="flex flex-col items-center">
@@ -367,6 +667,100 @@ export default function Map() {
         </div>
       )}
 
+      {/* ─── Tracking stats bar ──────────────────────── */}
+      {isTracking && (
+        <div className="glass-card animate-fade-in-up safe-bottom absolute bottom-0 left-0 right-0 z-[1000] px-4 pb-6 pt-4">
+          {gpsLost && (
+            <div className="toast-error mb-3 rounded-lg px-3 py-1.5 text-center text-xs">
+              Signal GPS perdu...
+            </div>
+          )}
+          <div className="mb-4 flex items-center justify-around font-[family-name:var(--font-montserrat)] text-sm">
+            <div className="flex flex-col items-center">
+              <span className="text-xl font-bold text-accent-cyan">
+                {(walkedDistance / 1000).toFixed(2)}
+              </span>
+              <span className="text-[10px] text-text-muted">km parcourus</span>
+            </div>
+            <div className="h-10 w-px bg-dark-border" />
+            <div className="flex flex-col items-center">
+              <span className="text-xl font-bold text-accent-cyan">
+                {formatTrackingTime(trackingTime)}
+              </span>
+              <span className="text-[10px] text-text-muted">temps</span>
+            </div>
+            <div className="h-10 w-px bg-dark-border" />
+            <div className="flex flex-col items-center">
+              <span className="text-xl font-bold text-accent-cyan">
+                {(remainingDistance / 1000).toFixed(2)}
+              </span>
+              <span className="text-[10px] text-text-muted">km restants</span>
+            </div>
+          </div>
+          <div className="flex gap-3">
+            {appMode === "tracking" ? (
+              <button
+                onClick={pauseTracking}
+                className="flex-1 rounded-xl bg-dark-border py-3 text-sm font-bold text-text-primary transition-all active:scale-95"
+              >
+                Pause
+              </button>
+            ) : (
+              <button
+                onClick={resumeTracking}
+                className="btn-gradient flex-1 rounded-xl py-3 text-sm"
+              >
+                Reprendre
+              </button>
+            )}
+            <button
+              onClick={() => stopTracking("abandoned")}
+              className="flex-1 rounded-xl bg-accent-red/20 py-3 text-sm font-bold text-accent-red transition-all active:scale-95"
+            >
+              Arrêter
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ─── Congrats modal ──────────────────────────── */}
+      {showCongrats && (
+        <div className="absolute inset-0 z-[2000] flex items-center justify-center bg-black/60">
+          <div className="glass-card animate-scale-in mx-4 max-w-sm p-6 text-center">
+            <div className="mb-3 text-5xl">&#127942;</div>
+            <h2 className="font-[family-name:var(--font-montserrat)] text-xl font-bold text-accent-cyan">
+              Parcours terminé !
+            </h2>
+            <div className="mt-4 flex justify-around">
+              <div className="flex flex-col items-center">
+                <span className="font-[family-name:var(--font-montserrat)] text-lg font-bold text-text-primary">
+                  {(walkedDistance / 1000).toFixed(2)} km
+                </span>
+                <span className="text-xs text-text-muted">distance</span>
+              </div>
+              <div className="flex flex-col items-center">
+                <span className="font-[family-name:var(--font-montserrat)] text-lg font-bold text-text-primary">
+                  {formatTrackingTime(trackingTime)}
+                </span>
+                <span className="text-xs text-text-muted">temps</span>
+              </div>
+              <div className="flex flex-col items-center">
+                <span className="font-[family-name:var(--font-montserrat)] text-lg font-bold text-text-primary">
+                  {Math.round(walkedDistance / 0.75).toLocaleString()}
+                </span>
+                <span className="text-xs text-text-muted">pas</span>
+              </div>
+            </div>
+            <button
+              onClick={() => setShowCongrats(false)}
+              className="btn-gradient mt-6 w-full rounded-xl py-3 text-sm"
+            >
+              Continuer
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ─── Paywall ─────────────────────────────────── */}
       {limitReached && (
         <div className="absolute inset-0 z-[2000] flex items-center justify-center bg-black/60">
@@ -392,13 +786,27 @@ export default function Map() {
       )}
 
       {/* ─── Action buttons ──────────────────────────── */}
-      {!limitReached && (
+      {!limitReached && !isTracking && !showCongrats && (
         <div className="absolute bottom-[max(1.5rem,env(safe-area-inset-bottom,0px))] left-1/2 z-[1000] flex -translate-x-1/2 gap-3">
+          {appMode === "route_shown" && !viewingHistory && (
+            <button
+              onClick={startTracking}
+              className="animate-fade-in-up flex items-center gap-2 rounded-full px-6 py-4 text-base font-bold shadow-lg active:scale-95"
+              style={{ background: "linear-gradient(135deg, #00f5d4, #00e676)", color: "#1a1a2e" }}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Démarrer
+            </button>
+          )}
           <button
             onClick={handleMainAction}
             disabled={appMode === "locating" || appMode === "generating"}
             className="animate-fade-in-up flex items-center justify-center gap-2 rounded-full px-6 py-4 text-base font-bold shadow-lg transition-all active:scale-95 disabled:opacity-50"
-            style={{ background: "linear-gradient(135deg, #00f5d4, #00e676)", color: "#1a1a2e" }}
+            style={
+              appMode === "route_shown" && !viewingHistory
+                ? { background: "#1e2a4a", color: "#f0f0f0", border: "1px solid #2a3a5c" }
+                : { background: "linear-gradient(135deg, #00f5d4, #00e676)", color: "#1a1a2e" }
+            }
           >
             {(appMode === "locating" || appMode === "generating") && (
               <span className="spinner-sm" />
@@ -417,7 +825,7 @@ export default function Map() {
       )}
 
       {/* ─── Route legend ────────────────────────────── */}
-      {routeData && (
+      {routeData && !isTracking && (
         <div className="glass-card absolute bottom-24 left-4 z-[1000] px-3 py-2">
           <div className="flex items-center gap-2 text-xs">
             <span className="font-medium text-accent-cyan">Départ</span>
@@ -433,13 +841,114 @@ export default function Map() {
         </div>
       )}
 
+      {/* ─── History button ──────────────────────────── */}
+      {!isTracking && (
+        <button
+          onClick={toggleHistory}
+          className="glass-card safe-top absolute top-4 left-4 z-[1000] flex items-center gap-1.5 px-3 py-2 text-sm text-text-secondary transition-colors hover:text-accent-cyan"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          Historique
+        </button>
+      )}
+
       {/* ─── Logout button ───────────────────────────── */}
-      <button
-        onClick={handleLogout}
-        className="glass-card safe-top absolute top-4 right-4 z-[1000] px-3 py-2 text-sm text-text-muted transition-colors hover:text-accent-red"
-      >
-        Déconnexion
-      </button>
+      {!isTracking && (
+        <button
+          onClick={handleLogout}
+          className="glass-card safe-top absolute top-4 right-4 z-[1000] px-3 py-2 text-sm text-text-muted transition-colors hover:text-accent-red"
+        >
+          Déconnexion
+        </button>
+      )}
+
+      {/* ─── History bottom sheet ────────────────────── */}
+      {showHistory && (
+        <div className="absolute inset-0 z-[1500]">
+          {/* Backdrop */}
+          <div
+            className="absolute inset-0 bg-black/40"
+            onClick={() => setShowHistory(false)}
+          />
+          {/* Sheet */}
+          <div className="glass-card animate-slide-up safe-bottom absolute bottom-0 left-0 right-0 max-h-[60vh] overflow-y-auto p-4">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="font-[family-name:var(--font-montserrat)] text-base font-bold text-text-primary">
+                Historique
+              </h3>
+              <button
+                onClick={() => setShowHistory(false)}
+                className="text-text-muted transition-colors hover:text-text-primary"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+
+            {historyLoading ? (
+              <div className="flex justify-center py-8">
+                <div className="spinner" />
+              </div>
+            ) : historyRoutes.length === 0 ? (
+              <p className="py-8 text-center text-sm text-text-muted">
+                Aucun parcours pour le moment
+              </p>
+            ) : (
+              <div className="space-y-3">
+                {historyRoutes.map((route) => (
+                  <div
+                    key={route.id}
+                    className="rounded-xl bg-dark-surface/80 p-3"
+                  >
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="text-xs text-text-muted">
+                        {formatDate(route.created_at)}
+                      </span>
+                      {statusBadge(route.status)}
+                    </div>
+                    <div className="mb-3 flex gap-4 text-sm">
+                      <span className="text-text-primary">
+                        <span className="font-semibold text-accent-cyan">
+                          {(route.distance_m / 1000).toFixed(1)}
+                        </span>{" "}
+                        km
+                      </span>
+                      <span className="text-text-primary">
+                        <span className="font-semibold text-accent-cyan">
+                          {route.steps_estimate.toLocaleString()}
+                        </span>{" "}
+                        pas
+                      </span>
+                      {route.duration_s && (
+                        <span className="text-text-primary">
+                          <span className="font-semibold text-accent-cyan">
+                            {formatDuration(route.duration_s)}
+                          </span>
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex gap-2">
+                      {route.geometry && (
+                        <button
+                          onClick={() => viewHistoryRoute(route)}
+                          className="flex-1 rounded-lg bg-dark-border py-1.5 text-xs font-semibold text-text-secondary transition-colors hover:text-accent-cyan"
+                        >
+                          Voir sur la carte
+                        </button>
+                      )}
+                      <button
+                        onClick={() => redoRoute(route)}
+                        className="flex-1 rounded-lg bg-accent-cyan/10 py-1.5 text-xs font-semibold text-accent-cyan transition-colors hover:bg-accent-cyan/20"
+                      >
+                        Refaire
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ─── Error toast ─────────────────────────────── */}
       {(geoError || routeError) && (
