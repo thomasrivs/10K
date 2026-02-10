@@ -567,6 +567,11 @@ export default function Map() {
       generateRoute();
     } else if (appMode === "route_shown" && !viewingHistory) {
       generateRoute();
+    } else if (appMode === "route_shown" && viewingHistory) {
+      setViewingHistory(null);
+      setRouteData(null);
+      setUserPosition(null);
+      setAppMode("idle");
     }
   };
 
@@ -636,7 +641,7 @@ export default function Map() {
 
       {/* ─── Route info panel ────────────────────────── */}
       {routeData && !isTracking && (
-        <div className="glass-card animate-fade-in-up safe-top absolute top-4 left-1/2 z-[1000] w-[90%] max-w-sm -translate-x-1/2 px-4 py-3">
+        <div className="glass-card animate-fade-in-up absolute top-[calc(env(safe-area-inset-top,0px)+1rem)] left-1/2 z-[1000] w-[90%] max-w-sm -translate-x-1/2 px-4 py-3">
           <div className="flex items-center justify-center gap-3 font-[family-name:var(--font-montserrat)] text-sm font-semibold">
             <div className="flex flex-col items-center">
               <span className="text-lg text-accent-cyan">
@@ -785,48 +790,48 @@ export default function Map() {
         </div>
       )}
 
-      {/* ─── Action buttons ──────────────────────────── */}
+      {/* ─── Bottom action bar ────────────────────────── */}
       {!limitReached && !isTracking && !showCongrats && (
-        <div className="absolute bottom-[max(1.5rem,env(safe-area-inset-bottom,0px))] left-1/2 z-[1000] flex -translate-x-1/2 gap-3">
-          {appMode === "route_shown" && !viewingHistory && (
-            <button
-              onClick={startTracking}
-              className="animate-fade-in-up flex items-center gap-2 rounded-full px-6 py-4 text-base font-bold shadow-lg active:scale-95"
-              style={{ background: "linear-gradient(135deg, #00f5d4, #00e676)", color: "#1a1a2e" }}
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-              Démarrer
-            </button>
-          )}
-          <button
-            onClick={handleMainAction}
-            disabled={appMode === "locating" || appMode === "generating"}
-            className="animate-fade-in-up flex items-center justify-center gap-2 rounded-full px-6 py-4 text-base font-bold shadow-lg transition-all active:scale-95 disabled:opacity-50"
-            style={
-              appMode === "route_shown" && !viewingHistory
-                ? { background: "#1e2a4a", color: "#f0f0f0", border: "1px solid #2a3a5c" }
-                : { background: "linear-gradient(135deg, #00f5d4, #00e676)", color: "#1a1a2e" }
-            }
-          >
-            {(appMode === "locating" || appMode === "generating") && (
-              <span className="spinner-sm" />
+        <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[1000] bg-gradient-to-t from-dark-base via-dark-base/60 to-transparent px-4 pb-[max(0.75rem,env(safe-area-inset-bottom,0px))] pt-12">
+          <div className="pointer-events-auto flex gap-3">
+            {appMode === "route_shown" && !viewingHistory && (
+              <button
+                onClick={startTracking}
+                className="animate-fade-in-up btn-gradient flex flex-1 items-center justify-center gap-2 rounded-xl py-3.5 text-base active:scale-[0.98]"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                Démarrer
+              </button>
             )}
-            {appMode === "idle"
-              ? "Me localiser"
-              : appMode === "locating"
-                ? "Localisation..."
-                : appMode === "generating"
-                  ? "Génération..."
-                  : appMode === "positioned"
-                    ? "Générer un parcours"
-                    : "Nouveau parcours"}
-          </button>
+            <button
+              onClick={handleMainAction}
+              disabled={appMode === "locating" || appMode === "generating"}
+              className={`animate-fade-in-up flex items-center justify-center gap-2 rounded-xl py-3.5 text-base font-bold transition-all active:scale-[0.98] disabled:opacity-50 ${
+                appMode === "route_shown" && !viewingHistory
+                  ? "border border-dark-border bg-dark-card px-5 text-text-secondary"
+                  : "btn-gradient flex-1"
+              }`}
+            >
+              {(appMode === "locating" || appMode === "generating") && (
+                <span className="spinner-sm" />
+              )}
+              {appMode === "idle"
+                ? "Me localiser"
+                : appMode === "locating"
+                  ? "Localisation..."
+                  : appMode === "generating"
+                    ? "Génération..."
+                    : appMode === "positioned"
+                      ? "Générer un parcours"
+                      : "Nouveau parcours"}
+            </button>
+          </div>
         </div>
       )}
 
       {/* ─── Route legend ────────────────────────────── */}
       {routeData && !isTracking && (
-        <div className="glass-card absolute bottom-24 left-4 z-[1000] px-3 py-2">
+        <div className="glass-card absolute bottom-28 left-4 z-[1000] px-3 py-2">
           <div className="flex items-center gap-2 text-xs">
             <span className="font-medium text-accent-cyan">Départ</span>
             <div
@@ -845,7 +850,7 @@ export default function Map() {
       {!isTracking && (
         <button
           onClick={toggleHistory}
-          className="glass-card safe-top absolute top-4 left-4 z-[1000] flex items-center gap-1.5 px-3 py-2 text-sm text-text-secondary transition-colors hover:text-accent-cyan"
+          className="glass-card absolute top-[calc(env(safe-area-inset-top,0px)+1rem)] left-4 z-[1000] flex items-center gap-1.5 px-3 py-2 text-sm text-text-secondary transition-colors hover:text-accent-cyan"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           Historique
@@ -856,7 +861,7 @@ export default function Map() {
       {!isTracking && (
         <button
           onClick={handleLogout}
-          className="glass-card safe-top absolute top-4 right-4 z-[1000] px-3 py-2 text-sm text-text-muted transition-colors hover:text-accent-red"
+          className="glass-card absolute top-[calc(env(safe-area-inset-top,0px)+1rem)] right-4 z-[1000] px-3 py-2 text-sm text-text-muted transition-colors hover:text-accent-red"
         >
           Déconnexion
         </button>
