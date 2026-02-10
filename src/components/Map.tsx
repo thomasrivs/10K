@@ -309,6 +309,8 @@ export default function Map() {
   const [gpsLost, setGpsLost] = useState(false);
   const [showCongrats, setShowCongrats] = useState(false);
   const [mapRotation, setMapRotation] = useState(0);
+  const [compassGranted, setCompassGranted] = useState(false);
+  const compassActiveRef = useRef(false);
   const watchIdRef = useRef<number | null>(null);
   const lastPosRef = useRef<[number, number] | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -351,6 +353,51 @@ export default function Map() {
       if (timerRef.current) clearInterval(timerRef.current);
     };
   }, [appMode]);
+
+  // ─── Compass heading for map rotation ───────────────────
+  useEffect(() => {
+    if (appMode !== "tracking" || !compassGranted) {
+      compassActiveRef.current = false;
+      return;
+    }
+    compassActiveRef.current = true;
+
+    let lastUpdate = 0;
+    const handler = (event: DeviceOrientationEvent) => {
+      const now = Date.now();
+      if (now - lastUpdate < 100) return;
+      lastUpdate = now;
+
+      let heading: number | null = null;
+      // iOS Safari
+      if ((event as any).webkitCompassHeading !== undefined) {
+        heading = (event as any).webkitCompassHeading as number;
+      }
+      // Android (absolute orientation)
+      else if (event.absolute && event.alpha !== null) {
+        heading = (360 - event.alpha) % 360;
+      }
+
+      if (heading !== null && !isNaN(heading)) {
+        setMapRotation((prev) => {
+          const prevMod = ((prev % 360) + 360) % 360;
+          let delta = heading! - prevMod;
+          if (delta > 180) delta -= 360;
+          if (delta < -180) delta += 360;
+          return prev + delta;
+        });
+      }
+    };
+
+    window.addEventListener("deviceorientationabsolute", handler as EventListener, true);
+    window.addEventListener("deviceorientation", handler, true);
+
+    return () => {
+      compassActiveRef.current = false;
+      window.removeEventListener("deviceorientationabsolute", handler as EventListener, true);
+      window.removeEventListener("deviceorientation", handler, true);
+    };
+  }, [appMode, compassGranted]);
 
   // ─── Auth ───────────────────────────────────────────────
   const handleLogout = async () => {
@@ -449,6 +496,21 @@ export default function Map() {
     lastPosRef.current = userPosition;
     setLivePosition(userPosition);
 
+    // Request compass permission (must be inside user gesture for iOS)
+    (async () => {
+      const DOE = DeviceOrientationEvent as any;
+      if (typeof DOE.requestPermission === "function") {
+        try {
+          const perm = await DOE.requestPermission();
+          setCompassGranted(perm === "granted");
+        } catch {
+          setCompassGranted(false);
+        }
+      } else {
+        setCompassGranted(true);
+      }
+    })();
+
     // Update route status to in_progress
     if (routeData.id) {
       fetch(`/api/route/${routeData.id}`, {
@@ -467,19 +529,21 @@ export default function Map() {
           const d = distanceBetween(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
           if (d > 3 && d < 100) {
             setWalkedDistance((prev) => prev + d);
-            // Compute heading from GPS or movement direction
-            let h = pos.coords.heading;
-            if (h === null || h === undefined || isNaN(h)) {
-              h = bearing(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
-            }
-            if (typeof h === "number" && !isNaN(h)) {
-              setMapRotation((prev) => {
-                const prevMod = ((prev % 360) + 360) % 360;
-                let delta = h - prevMod;
-                if (delta > 180) delta -= 360;
-                if (delta < -180) delta += 360;
-                return prev + delta;
-              });
+            // Heading from movement (fallback when compass not available)
+            if (!compassActiveRef.current) {
+              let h = pos.coords.heading;
+              if (h === null || h === undefined || isNaN(h)) {
+                h = bearing(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
+              }
+              if (typeof h === "number" && !isNaN(h)) {
+                setMapRotation((prev) => {
+                  const prevMod = ((prev % 360) + 360) % 360;
+                  let delta = h - prevMod;
+                  if (delta > 180) delta -= 360;
+                  if (delta < -180) delta += 360;
+                  return prev + delta;
+                });
+              }
             }
           }
         }
@@ -510,18 +574,20 @@ export default function Map() {
           const d = distanceBetween(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
           if (d > 3 && d < 100) {
             setWalkedDistance((prev) => prev + d);
-            let h = pos.coords.heading;
-            if (h === null || h === undefined || isNaN(h)) {
-              h = bearing(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
-            }
-            if (typeof h === "number" && !isNaN(h)) {
-              setMapRotation((prev) => {
-                const prevMod = ((prev % 360) + 360) % 360;
-                let delta = h - prevMod;
-                if (delta > 180) delta -= 360;
-                if (delta < -180) delta += 360;
-                return prev + delta;
-              });
+            if (!compassActiveRef.current) {
+              let h = pos.coords.heading;
+              if (h === null || h === undefined || isNaN(h)) {
+                h = bearing(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
+              }
+              if (typeof h === "number" && !isNaN(h)) {
+                setMapRotation((prev) => {
+                  const prevMod = ((prev % 360) + 360) % 360;
+                  let delta = h - prevMod;
+                  if (delta > 180) delta -= 360;
+                  if (delta < -180) delta += 360;
+                  return prev + delta;
+                });
+              }
             }
           }
         }
@@ -702,7 +768,7 @@ export default function Map() {
 
       {/* ─── Route info panel ────────────────────────── */}
       {routeData && !isTracking && (
-        <div className="glass-card animate-fade-in-up absolute top-[calc(env(safe-area-inset-top,0px)+1rem)] left-1/2 z-[1000] w-[90%] max-w-sm -translate-x-1/2 px-4 py-3">
+        <div className="glass-card animate-fade-in-up absolute top-[calc(env(safe-area-inset-top,0px)+4rem)] left-1/2 z-[1000] w-[90%] max-w-sm -translate-x-1/2 px-4 py-3">
           <div className="flex items-center justify-center gap-3 font-[family-name:var(--font-montserrat)] text-sm font-semibold">
             <div className="flex flex-col items-center">
               <span className="text-lg text-accent-cyan">
