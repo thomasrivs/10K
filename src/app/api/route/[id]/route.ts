@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 
+const MAX_BODY_SIZE = 1024; // 1 KB
+const ALLOWED_FIELDS = new Set(["status", "walked_distance_m", "walked_duration_s"]);
+
 async function getSupabaseClient(request: NextRequest) {
   const response = NextResponse.next({ request });
 
@@ -30,6 +33,16 @@ export async function PATCH(
 ) {
   try {
     const { id } = await params;
+
+    // Validate body size
+    const contentLength = request.headers.get("content-length");
+    if (contentLength && parseInt(contentLength, 10) > MAX_BODY_SIZE) {
+      return NextResponse.json(
+        { error: "Corps de requête trop volumineux" },
+        { status: 413 }
+      );
+    }
+
     const { supabase } = await getSupabaseClient(request);
 
     const {
@@ -40,11 +53,47 @@ export async function PATCH(
       return NextResponse.json({ error: "Non authentifié" }, { status: 401 });
     }
 
-    const body = await request.json();
+    // Parse and validate body
+    const rawBody = await request.text();
+    if (rawBody.length > MAX_BODY_SIZE) {
+      return NextResponse.json(
+        { error: "Corps de requête trop volumineux" },
+        { status: 413 }
+      );
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawBody);
+    } catch {
+      return NextResponse.json(
+        { error: "JSON invalide" },
+        { status: 400 }
+      );
+    }
+
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return NextResponse.json(
+        { error: "Le body doit être un objet JSON" },
+        { status: 400 }
+      );
+    }
+
+    const body = parsed as Record<string, unknown>;
+
+    // Only allow known fields
+    const unknownFields = Object.keys(body).filter((k) => !ALLOWED_FIELDS.has(k));
+    if (unknownFields.length > 0) {
+      return NextResponse.json(
+        { error: `Champs non autorisés : ${unknownFields.join(", ")}` },
+        { status: 400 }
+      );
+    }
+
     const { status, walked_distance_m, walked_duration_s } = body;
 
     const validStatuses = ["in_progress", "completed", "abandoned"];
-    if (status && !validStatuses.includes(status)) {
+    if (status && !validStatuses.includes(status as string)) {
       return NextResponse.json(
         { error: "Statut invalide" },
         { status: 400 }
