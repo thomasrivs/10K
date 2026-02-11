@@ -1,10 +1,6 @@
 import { isInDangerZone, routePassesThroughDangerZone } from "./danger-zones";
 
 const OSRM_BASE_URL = "https://router.project-osrm.org";
-const TARGET_DISTANCE_M = 7500; // ~10,000 steps at 0.75m/step
-const MIN_DISTANCE_M = 6750; // 9,000 steps
-const MAX_DISTANCE_M = 8250; // 11,000 steps
-const NUM_WAYPOINTS = 6;
 const MAX_WAYPOINT_RETRIES = 3;
 
 const CUL_DE_SAC_THRESHOLD_M = 10; // Max 10m of retracing allowed
@@ -53,6 +49,7 @@ function haversineM(
 
 /**
  * Generate a single waypoint at a given angle and radius from center.
+ * Tight jitter (±5% radius, ±0.05 rad angle) to keep a round shape.
  */
 function generateSingleWaypoint(
   centerLat: number,
@@ -63,8 +60,8 @@ function generateSingleWaypoint(
   const latDegPerKm = 1 / 111.32;
   const lngDegPerKm = 1 / (111.32 * Math.cos((centerLat * Math.PI) / 180));
 
-  const r = radiusKm * (0.9 + Math.random() * 0.2);
-  const jitter = (Math.random() - 0.5) * 0.1;
+  const r = radiusKm * (0.95 + Math.random() * 0.1);
+  const jitter = (Math.random() - 0.5) * 0.05;
 
   const lat = centerLat + r * latDegPerKm * Math.sin(angle + jitter);
   const lng = centerLng + r * lngDegPerKm * Math.cos(angle + jitter);
@@ -270,6 +267,117 @@ function hasCulDeSac(geometry: GeoJSON.LineString): boolean {
   return false;
 }
 
+/**
+ * Self-intersection detection.
+ *
+ * Checks if any two non-adjacent segments of the route cross each other.
+ * Uses a sampled approach (every Nth point) to keep it fast on large geometries.
+ * Excludes the loop closure zone (first/last 5%) where start≈end.
+ *
+ * Returns true if any crossing is detected.
+ */
+function hasSelfIntersection(geometry: GeoJSON.LineString): boolean {
+  const coords = geometry.coordinates;
+  const total = coords.length;
+  if (total < 40) return false;
+
+  // Sample every Nth point to build simplified segments
+  const SAMPLE = Math.max(1, Math.floor(total / 200));
+  const sampled: [number, number][] = [];
+  for (let i = 0; i < total; i += SAMPLE) {
+    sampled.push([coords[i][0], coords[i][1]]);
+  }
+  // Ensure last point is included
+  sampled.push([coords[total - 1][0], coords[total - 1][1]]);
+
+  const n = sampled.length;
+  // Skip closure zone: first/last 5% of sampled points
+  const zoneSkip = Math.max(2, Math.floor(n * 0.05));
+
+  // ccw helper
+  const cross = (
+    ax: number, ay: number,
+    bx: number, by: number,
+    cx: number, cy: number
+  ) => (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+
+  for (let i = 0; i < n - 1; i++) {
+    const [ax, ay] = sampled[i];
+    const [bx, by] = sampled[i + 1];
+
+    // Only check segments far enough apart (skip adjacent + closure zone)
+    for (let j = i + 2; j < n - 1; j++) {
+      // Skip closure zone overlap
+      if (i < zoneSkip && j >= n - 1 - zoneSkip) continue;
+      if (j < zoneSkip && i >= n - 1 - zoneSkip) continue;
+
+      const [cx, cy] = sampled[j];
+      const [dx, dy] = sampled[j + 1];
+
+      const d1 = cross(ax, ay, bx, by, cx, cy);
+      const d2 = cross(ax, ay, bx, by, dx, dy);
+      const d3 = cross(cx, cy, dx, dy, ax, ay);
+      const d4 = cross(cx, cy, dx, dy, bx, by);
+
+      if (d1 * d2 < 0 && d3 * d4 < 0) {
+        return true; // Segments cross
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Circularity score: how "round" is the route?
+ *
+ * Computes the ratio of the route's bounding box longest side vs shortest.
+ * A perfect circle has ratio 1.0. We also check that the route's area
+ * (via shoelace formula) is a reasonable fraction of the bounding box area.
+ *
+ * Returns a score from 0 (perfect circle) to higher = worse.
+ * Score < 1.0 is considered "good enough" for a round loop.
+ */
+function circularityScore(geometry: GeoJSON.LineString): number {
+  const coords = geometry.coordinates;
+  if (coords.length < 10) return 0;
+
+  // Bounding box
+  let minLng = Infinity, maxLng = -Infinity;
+  let minLat = Infinity, maxLat = -Infinity;
+  for (const [lng, lat] of coords) {
+    if (lng < minLng) minLng = lng;
+    if (lng > maxLng) maxLng = lng;
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+  }
+
+  const widthM = haversineM(minLng, (minLat + maxLat) / 2, maxLng, (minLat + maxLat) / 2);
+  const heightM = haversineM((minLng + maxLng) / 2, minLat, (minLng + maxLng) / 2, maxLat);
+
+  if (widthM < 50 || heightM < 50) return 10; // Degenerate
+
+  // Aspect ratio penalty: 1.0 = perfect square, higher = elongated
+  const aspect = Math.max(widthM, heightM) / Math.min(widthM, heightM);
+
+  // Shoelace area of the route polygon (in degree² — just for ratio)
+  let area = 0;
+  for (let i = 0; i < coords.length - 1; i++) {
+    area += coords[i][0] * coords[i + 1][1] - coords[i + 1][0] * coords[i][1];
+  }
+  area = Math.abs(area) / 2;
+
+  // Bounding box area in degree²
+  const bboxArea = (maxLng - minLng) * (maxLat - minLat);
+  // Ideal circle fills ~π/4 ≈ 0.785 of its bounding square
+  // We want area/bbox to be at least ~0.3 (generous for street routes)
+  const fillRatio = bboxArea > 0 ? area / bboxArea : 0;
+  const fillPenalty = fillRatio < 0.2 ? 3 : fillRatio < 0.3 ? 1 : 0;
+
+  // Final score: aspect ratio - 1 (so perfect square = 0) + fill penalty
+  return (aspect - 1) + fillPenalty;
+}
+
 function buildResult(
   distance: number,
   geometry: GeoJSON.LineString,
@@ -289,19 +397,24 @@ function buildResult(
 
 /**
  * Main route generation function.
- * Generates a clean walking LOOP of ~7.5km (9000-11000 steps) from a starting point.
- * Strictly rejects any route with cul-de-sacs (>10m backtracking).
+ * Generates a clean, roughly circular walking LOOP from a starting point.
+ * Quality checks: distance range, no cul-de-sacs, no self-intersections, good circularity.
  * Tries up to MAX_ATTEMPTS times, returns the best valid route.
  */
 export async function generateRoute(
   lat: number,
-  lng: number
+  lng: number,
+  targetSteps: number = 10000
 ): Promise<RouteResult> {
-  let radiusKm = 1.2;
+  const targetDistanceM = targetSteps * 0.75;
+  const minDistanceM = targetDistanceM * 0.9;
+  const maxDistanceM = targetDistanceM * 1.1;
+  const numWaypoints = Math.max(3, Math.min(8, Math.round(targetDistanceM / 1500)));
+  let radiusKm = 1.2 * (targetDistanceM / 7500);
   let bestAny: CandidateRoute | null = null; // best route overall (fallback)
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const waypoints = generateSafeWaypoints(lat, lng, radiusKm, NUM_WAYPOINTS);
+    const waypoints = generateSafeWaypoints(lat, lng, radiusKm, numWaypoints);
 
     let result;
     try {
@@ -314,14 +427,21 @@ export async function generateRoute(
     if (routePassesThroughDangerZone(result.geometry)) continue;
 
     const distanceOk =
-      result.distance >= MIN_DISTANCE_M && result.distance <= MAX_DISTANCE_M;
+      result.distance >= minDistanceM && result.distance <= maxDistanceM;
     const culDeSac = hasCulDeSac(result.geometry);
+    const selfCross = hasSelfIntersection(result.geometry);
+    const circScore = circularityScore(result.geometry);
+    const shapeOk = !selfCross && circScore < 1.5;
 
     // Score: 0 = perfect, higher = worse
-    const score = (distanceOk ? 0 : 1) + (culDeSac ? 5 : 0);
+    const score =
+      (distanceOk ? 0 : 1) +
+      (culDeSac ? 5 : 0) +
+      (selfCross ? 4 : 0) +
+      circScore;
 
     // Perfect route found — return immediately
-    if (distanceOk && !culDeSac) {
+    if (distanceOk && !culDeSac && shapeOk) {
       return buildResult(result.distance, result.geometry, waypoints, result.maneuvers);
     }
 
@@ -338,7 +458,7 @@ export async function generateRoute(
 
     // Adjust radius to converge toward target distance
     if (!distanceOk) {
-      const ratio = TARGET_DISTANCE_M / result.distance;
+      const ratio = targetDistanceM / result.distance;
       radiusKm = radiusKm * ratio;
       radiusKm = Math.max(0.3, Math.min(3.0, radiusKm));
     }
@@ -350,7 +470,7 @@ export async function generateRoute(
   }
 
   // Ultimate fallback
-  const waypoints = generateSafeWaypoints(lat, lng, radiusKm, NUM_WAYPOINTS);
+  const waypoints = generateSafeWaypoints(lat, lng, radiusKm, numWaypoints);
   const result = await callOSRM([lat, lng], waypoints);
   return buildResult(result.distance, result.geometry, waypoints, result.maneuvers);
 }
