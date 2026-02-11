@@ -10,18 +10,27 @@ const MAX_WAYPOINT_RETRIES = 3;
 const CUL_DE_SAC_THRESHOLD_M = 10; // Max 10m of retracing allowed
 const MAX_ATTEMPTS = 20;
 
+export interface TurnManeuver {
+  lat: number;
+  lng: number;
+  instruction: string;
+  type: "left" | "right" | "slight_left" | "slight_right" | "uturn";
+}
+
 interface RouteResult {
   distance: number; // meters
   duration: number; // seconds
   geometry: GeoJSON.LineString;
   waypoints: [number, number][];
   stepsEstimate: number;
+  maneuvers: TurnManeuver[];
 }
 
 interface CandidateRoute {
   distance: number;
   geometry: GeoJSON.LineString;
   waypoints: [number, number][];
+  maneuvers: TurnManeuver[];
   score: number;
 }
 
@@ -113,6 +122,8 @@ function generateSafeWaypoints(
 /**
  * Call OSRM route service to get a walking route through waypoints.
  */
+const TURN_TYPES = new Set(["turn", "end of road", "fork", "roundabout turn"]);
+
 async function callOSRM(
   start: [number, number],
   waypoints: [number, number][]
@@ -120,13 +131,14 @@ async function callOSRM(
   distance: number;
   duration: number;
   geometry: GeoJSON.LineString;
+  maneuvers: TurnManeuver[];
 }> {
   const allPoints = [start, ...waypoints, start];
   const coordString = allPoints
     .map(([lat, lng]) => `${lng},${lat}`)
     .join(";");
 
-  const url = `${OSRM_BASE_URL}/route/v1/foot/${coordString}?overview=full&geometries=geojson&continue_straight=true`;
+  const url = `${OSRM_BASE_URL}/route/v1/foot/${coordString}?overview=full&geometries=geojson&continue_straight=true&steps=true`;
 
   const response = await fetch(url);
   if (!response.ok) {
@@ -140,10 +152,37 @@ async function callOSRM(
   }
 
   const route = data.routes[0];
+
+  // Extract turn maneuvers from all legs/steps
+  const maneuvers: TurnManeuver[] = [];
+  for (const leg of route.legs ?? []) {
+    for (const step of leg.steps ?? []) {
+      const m = step.maneuver;
+      if (!TURN_TYPES.has(m.type)) continue;
+      const mod: string = m.modifier ?? "";
+      let type: TurnManeuver["type"] | null = null;
+      let instruction = "";
+      if (mod.includes("left")) {
+        type = mod === "slight left" ? "slight_left" : "left";
+        instruction = mod === "slight left" ? "Légèrement à gauche" : "Tournez à gauche";
+      } else if (mod.includes("right")) {
+        type = mod === "slight right" ? "slight_right" : "right";
+        instruction = mod === "slight right" ? "Légèrement à droite" : "Tournez à droite";
+      } else if (mod === "uturn") {
+        type = "uturn";
+        instruction = "Faites demi-tour";
+      }
+      if (type) {
+        maneuvers.push({ lat: m.location[1], lng: m.location[0], instruction, type });
+      }
+    }
+  }
+
   return {
     distance: route.distance,
     duration: route.duration,
     geometry: route.geometry,
+    maneuvers,
   };
 }
 
@@ -234,7 +273,8 @@ function hasCulDeSac(geometry: GeoJSON.LineString): boolean {
 function buildResult(
   distance: number,
   geometry: GeoJSON.LineString,
-  waypoints: [number, number][]
+  waypoints: [number, number][],
+  maneuvers: TurnManeuver[]
 ): RouteResult {
   const walkingDurationSeconds = Math.round((distance / 5000) * 3600);
   return {
@@ -243,6 +283,7 @@ function buildResult(
     geometry,
     waypoints,
     stepsEstimate: Math.round(distance / 0.75),
+    maneuvers,
   };
 }
 
@@ -281,7 +322,7 @@ export async function generateRoute(
 
     // Perfect route found — return immediately
     if (distanceOk && !culDeSac) {
-      return buildResult(result.distance, result.geometry, waypoints);
+      return buildResult(result.distance, result.geometry, waypoints, result.maneuvers);
     }
 
     // Track best overall (for fallback)
@@ -290,6 +331,7 @@ export async function generateRoute(
         distance: result.distance,
         geometry: result.geometry,
         waypoints,
+        maneuvers: result.maneuvers,
         score,
       };
     }
@@ -304,11 +346,11 @@ export async function generateRoute(
 
   // Fallback: return best route found (may not be perfect)
   if (bestAny) {
-    return buildResult(bestAny.distance, bestAny.geometry, bestAny.waypoints);
+    return buildResult(bestAny.distance, bestAny.geometry, bestAny.waypoints, bestAny.maneuvers);
   }
 
   // Ultimate fallback
   const waypoints = generateSafeWaypoints(lat, lng, radiusKm, NUM_WAYPOINTS);
   const result = await callOSRM([lat, lng], waypoints);
-  return buildResult(result.distance, result.geometry, waypoints);
+  return buildResult(result.distance, result.geometry, waypoints, result.maneuvers);
 }

@@ -33,12 +33,20 @@ type AppMode =
   | "tracking"
   | "paused";
 
+interface TurnManeuver {
+  lat: number;
+  lng: number;
+  instruction: string;
+  type: "left" | "right" | "slight_left" | "slight_right" | "uturn";
+}
+
 interface RouteData {
   id: string | null;
   distance_m: number;
   duration_s: number;
   steps_estimate: number;
   geometry: GeoJSON.LineString;
+  maneuvers?: TurnManeuver[];
   routes_used: number;
   routes_limit: number;
 }
@@ -310,7 +318,10 @@ export default function Map() {
   const [showCongrats, setShowCongrats] = useState(false);
   const [mapRotation, setMapRotation] = useState(0);
   const [compassGranted, setCompassGranted] = useState(false);
+  const [nextManeuverIdx, setNextManeuverIdx] = useState(0);
   const compassActiveRef = useRef(false);
+  const nextManeuverIdxRef = useRef(0);
+  const lastAnnouncedRef = useRef(-1);
   const watchIdRef = useRef<number | null>(null);
   const lastPosRef = useRef<[number, number] | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -493,6 +504,9 @@ export default function Map() {
     setTrackingTime(0);
     setGpsLost(false);
     setMapRotation(0);
+    setNextManeuverIdx(0);
+    nextManeuverIdxRef.current = 0;
+    lastAnnouncedRef.current = -1;
     lastPosRef.current = userPosition;
     setLivePosition(userPosition);
 
@@ -548,6 +562,34 @@ export default function Map() {
           }
         }
         lastPosRef.current = newPos;
+
+        // Turn-by-turn maneuver tracking
+        const mnvs = routeData?.maneuvers ?? [];
+        while (nextManeuverIdxRef.current < mnvs.length) {
+          const m = mnvs[nextManeuverIdxRef.current];
+          const dm = distanceBetween(newPos[0], newPos[1], m.lat, m.lng);
+          if (dm < 25) {
+            nextManeuverIdxRef.current++;
+          } else {
+            if (dm < 80 && lastAnnouncedRef.current !== nextManeuverIdxRef.current) {
+              lastAnnouncedRef.current = nextManeuverIdxRef.current;
+              if ("speechSynthesis" in window) {
+                const u = new SpeechSynthesisUtterance(
+                  `Dans ${Math.round(dm)} mètres, ${m.instruction.toLowerCase()}`
+                );
+                u.lang = "fr-FR";
+                u.rate = 1.1;
+                speechSynthesis.speak(u);
+              }
+              if ("vibrate" in navigator) {
+                navigator.vibrate([200, 100, 200]);
+              }
+            }
+            break;
+          }
+        }
+        setNextManeuverIdx(nextManeuverIdxRef.current);
+
         checkArrival(newPos);
       },
       () => setGpsLost(true),
@@ -592,6 +634,34 @@ export default function Map() {
           }
         }
         lastPosRef.current = newPos;
+
+        // Turn-by-turn maneuver tracking
+        const mnvs = routeData?.maneuvers ?? [];
+        while (nextManeuverIdxRef.current < mnvs.length) {
+          const m = mnvs[nextManeuverIdxRef.current];
+          const dm = distanceBetween(newPos[0], newPos[1], m.lat, m.lng);
+          if (dm < 25) {
+            nextManeuverIdxRef.current++;
+          } else {
+            if (dm < 80 && lastAnnouncedRef.current !== nextManeuverIdxRef.current) {
+              lastAnnouncedRef.current = nextManeuverIdxRef.current;
+              if ("speechSynthesis" in window) {
+                const u = new SpeechSynthesisUtterance(
+                  `Dans ${Math.round(dm)} mètres, ${m.instruction.toLowerCase()}`
+                );
+                u.lang = "fr-FR";
+                u.rate = 1.1;
+                speechSynthesis.speak(u);
+              }
+              if ("vibrate" in navigator) {
+                navigator.vibrate([200, 100, 200]);
+              }
+            }
+            break;
+          }
+        }
+        setNextManeuverIdx(nextManeuverIdxRef.current);
+
         checkArrival(newPos);
       },
       () => setGpsLost(true),
@@ -693,6 +763,12 @@ export default function Map() {
   const isTracking = appMode === "tracking" || appMode === "paused";
   const remainingDistance = routeData ? Math.max(0, routeData.distance_m - walkedDistance) : 0;
   const activeGeometry = routeData?.geometry ?? viewingHistory?.geometry ?? null;
+  const maneuvers = routeData?.maneuvers ?? [];
+  const nextManeuver = maneuvers[nextManeuverIdx] ?? null;
+  const distToNextManeuver = nextManeuver && livePosition
+    ? distanceBetween(livePosition[0], livePosition[1], nextManeuver.lat, nextManeuver.lng)
+    : Infinity;
+  const showTurnBanner = isTracking && nextManeuver && distToNextManeuver < 100;
 
   return (
     <div className="relative h-full w-full overflow-hidden">
@@ -765,6 +841,36 @@ export default function Map() {
         )}
       </MapContainer>
       </div>
+
+      {/* ─── Turn instruction banner ─────────────────── */}
+      {showTurnBanner && nextManeuver && (
+        <div className="glass-card animate-fade-in-up absolute top-[calc(env(safe-area-inset-top,0px)+1rem)] left-1/2 z-[1100] flex -translate-x-1/2 items-center gap-3 px-5 py-3">
+          {nextManeuver.type.includes("left") ? (
+            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="#00f5d4" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M10 8L4 14L10 20"/>
+              <path d="M4 14H22C24.2 14 26 15.8 26 18V28"/>
+            </svg>
+          ) : nextManeuver.type.includes("right") ? (
+            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="#00f5d4" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 8L28 14L22 20"/>
+              <path d="M28 14H10C7.8 14 6 15.8 6 18V28"/>
+            </svg>
+          ) : (
+            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="#00f5d4" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M10 20L4 14L10 8"/>
+              <path d="M4 14H16C20.4 14 24 17.6 24 22V28"/>
+            </svg>
+          )}
+          <div>
+            <p className="font-[family-name:var(--font-montserrat)] text-sm font-bold text-text-primary">
+              {nextManeuver.instruction}
+            </p>
+            <p className="text-xs text-text-muted">
+              dans {Math.round(distToNextManeuver)} m
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* ─── Route info panel ────────────────────────── */}
       {routeData && !isTracking && (

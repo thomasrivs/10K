@@ -180,6 +180,7 @@ export async function POST(request: NextRequest) {
       duration_s: route.duration,
       steps_estimate: route.stepsEstimate,
       geometry: route.geometry,
+      maneuvers: route.maneuvers,
       routes_used: routeCount + 1,
       routes_limit: FREE_ROUTE_LIMIT,
     });
