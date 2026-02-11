@@ -310,6 +310,7 @@ export default function Map() {
   const [routeData, setRouteData] = useState<RouteData | null>(null);
   const [routeError, setRouteError] = useState<string | null>(null);
   const [limitReached, setLimitReached] = useState(false);
+  const [targetSteps, setTargetSteps] = useState(10000);
 
   // Tracking state
   const [walkedDistance, setWalkedDistance] = useState(0);
@@ -463,7 +464,7 @@ export default function Map() {
       const res = await fetch("/api/route", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lat: userPosition[0], lng: userPosition[1] }),
+        body: JSON.stringify({ lat: userPosition[0], lng: userPosition[1], targetSteps }),
       });
 
       const data = await res.json();
@@ -1026,6 +1027,28 @@ export default function Map() {
       {/* ─── Bottom action bar ────────────────────────── */}
       {!limitReached && !isTracking && !showCongrats && (
         <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[1000] bg-gradient-to-t from-dark-base via-dark-base/60 to-transparent px-4 pb-[max(0.75rem,env(safe-area-inset-bottom,0px))] pt-12">
+          {appMode === "positioned" && (
+            <div className="pointer-events-auto mb-4 rounded-xl bg-dark-card/90 px-4 py-3">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-xs font-medium text-text-secondary">Objectif</span>
+                <span className="font-[family-name:var(--font-montserrat)] text-sm font-bold text-accent-cyan">
+                  {(targetSteps / 1000).toFixed(0)}K pas
+                </span>
+              </div>
+              <input
+                type="range"
+                min={2000}
+                max={15000}
+                step={1000}
+                value={targetSteps}
+                onChange={(e) => setTargetSteps(Number(e.target.value))}
+              />
+              <div className="mt-1 flex justify-between text-[10px] text-text-muted">
+                <span>2K</span>
+                <span>15K</span>
+              </div>
+            </div>
+          )}
           <div className="pointer-events-auto flex gap-3">
             {appMode === "route_shown" && !viewingHistory && (
               <button
