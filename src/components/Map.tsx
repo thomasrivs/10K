@@ -1028,12 +1028,12 @@ export default function Map() {
       {!limitReached && !isTracking && !showCongrats && (
         <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[1000] bg-gradient-to-t from-dark-base via-dark-base/60 to-transparent px-4 pb-[max(0.75rem,env(safe-area-inset-bottom,0px))] pt-12">
           {appMode === "positioned" && (
-            <div className="pointer-events-auto mb-4 rounded-xl bg-dark-card/90 px-4 py-3">
-              <div className="mb-2 flex items-center justify-between">
-                <span className="text-xs font-medium text-text-secondary">Objectif</span>
-                <span className="font-[family-name:var(--font-montserrat)] text-sm font-bold text-accent-cyan">
-                  {(targetSteps / 1000).toFixed(0)}K pas
+            <div className="pointer-events-auto mb-5">
+              <div className="mb-3 text-center">
+                <span className="font-[family-name:var(--font-montserrat)] text-3xl font-extrabold text-accent-cyan">
+                  {(targetSteps / 1000).toFixed(0)}K
                 </span>
+                <span className="ml-1 text-sm font-medium text-text-secondary">pas</span>
               </div>
               <input
                 type="range"
@@ -1042,9 +1042,15 @@ export default function Map() {
                 step={1000}
                 value={targetSteps}
                 onChange={(e) => setTargetSteps(Number(e.target.value))}
+                className="w-full"
+                style={{
+                  background: `linear-gradient(to right, #00f5d4 0%, #00e676 ${((targetSteps - 2000) / 13000) * 100}%, #2a3a5c ${((targetSteps - 2000) / 13000) * 100}%, #2a3a5c 100%)`,
+                }}
               />
-              <div className="mt-1 flex justify-between text-[10px] text-text-muted">
+              <div className="mt-2 flex justify-between px-1 text-[10px] text-text-muted">
                 <span>2K</span>
+                <span>5K</span>
+                <span>10K</span>
                 <span>15K</span>
               </div>
             </div>
