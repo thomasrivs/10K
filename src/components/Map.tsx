@@ -316,6 +316,12 @@ export default function Map() {
   const [limitReached, setLimitReached] = useState(false);
   const [targetSteps, setTargetSteps] = useState(10000);
 
+  // Free walk state
+  const [freeWalk, setFreeWalk] = useState(false);
+  const freeWalkRef = useRef(false);
+  const freeWalkPathRef = useRef<[number, number][]>([]);
+  const [freeWalkCoords, setFreeWalkCoords] = useState<[number, number][]>([]);
+
   // Tracking state
   const [walkedDistance, setWalkedDistance] = useState(0);
   const [trackingTime, setTrackingTime] = useState(0);
@@ -495,20 +501,45 @@ export default function Map() {
       if ("speechSynthesis" in window) speechSynthesis.cancel();
       if ("vibrate" in navigator) navigator.vibrate(0);
 
+      const isFreeWalk = freeWalkRef.current;
+
       // Save to DB
       if (routeData?.id) {
+        const patchBody: Record<string, unknown> = {
+          status,
+          walked_distance_m: walkedDistance,
+          walked_duration_s: trackingTime,
+        };
+
+        if (isFreeWalk) {
+          const path = freeWalkPathRef.current;
+          patchBody.geometry = {
+            type: "LineString",
+            coordinates: path.map(([lat, lng]) => [lng, lat]),
+          };
+          patchBody.distance_m = Math.round(walkedDistance);
+          patchBody.steps_estimate = Math.round(walkedDistance / 0.75);
+          patchBody.duration_s = trackingTime;
+        }
+
         fetch(`/api/route/${routeData.id}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            status,
-            walked_distance_m: walkedDistance,
-            walked_duration_s: trackingTime,
-          }),
+          body: JSON.stringify(patchBody),
         }).catch(() => {});
       }
 
-      setAppMode("route_shown");
+      if (isFreeWalk) {
+        if (status === "completed") setShowCongrats(true);
+        setFreeWalk(false);
+        freeWalkRef.current = false;
+        freeWalkPathRef.current = [];
+        setFreeWalkCoords([]);
+        setRouteData(null);
+        setAppMode("positioned");
+      } else {
+        setAppMode("route_shown");
+      }
     },
     [routeData, walkedDistance, trackingTime]
   );
@@ -537,6 +568,13 @@ export default function Map() {
         );
         if (d > 3 && d < 100) {
           setWalkedDistance((prev) => prev + d);
+
+          // Accumulate path in free walk mode
+          if (freeWalkRef.current) {
+            freeWalkPathRef.current.push(newPos);
+            setFreeWalkCoords([...freeWalkPathRef.current]);
+          }
+
           if (!compassActiveRef.current) {
             let h = pos.coords.heading;
             if (h === null || h === undefined || isNaN(h)) {
@@ -556,40 +594,44 @@ export default function Map() {
       }
       lastPosRef.current = newPos;
 
-      // Turn-by-turn maneuver tracking
-      const mnvs = routeData?.maneuvers ?? [];
-      while (nextManeuverIdxRef.current < mnvs.length) {
-        const m = mnvs[nextManeuverIdxRef.current];
-        const dm = distanceBetween(newPos[0], newPos[1], m.lat, m.lng);
-        if (dm < 25) {
-          nextManeuverIdxRef.current++;
-        } else {
-          if (dm < 80 && lastAnnouncedRef.current !== nextManeuverIdxRef.current) {
-            lastAnnouncedRef.current = nextManeuverIdxRef.current;
-            if ("speechSynthesis" in window) {
-              const u = new SpeechSynthesisUtterance(
-                `Dans ${Math.round(dm)} mètres, ${m.instruction.toLowerCase()}`
-              );
-              u.lang = "fr-FR";
-              u.rate = 1.1;
-              speechSynthesis.speak(u);
+      // Skip maneuver tracking and arrival check in free walk mode
+      if (!freeWalkRef.current) {
+        // Turn-by-turn maneuver tracking
+        const mnvs = routeData?.maneuvers ?? [];
+        while (nextManeuverIdxRef.current < mnvs.length) {
+          const m = mnvs[nextManeuverIdxRef.current];
+          const dm = distanceBetween(newPos[0], newPos[1], m.lat, m.lng);
+          if (dm < 25) {
+            nextManeuverIdxRef.current++;
+          } else {
+            if (dm < 80 && lastAnnouncedRef.current !== nextManeuverIdxRef.current) {
+              lastAnnouncedRef.current = nextManeuverIdxRef.current;
+              if ("speechSynthesis" in window) {
+                const u = new SpeechSynthesisUtterance(
+                  `Dans ${Math.round(dm)} mètres, ${m.instruction.toLowerCase()}`
+                );
+                u.lang = "fr-FR";
+                u.rate = 1.1;
+                speechSynthesis.speak(u);
+              }
+              if ("vibrate" in navigator) {
+                navigator.vibrate([200, 100, 200]);
+              }
             }
-            if ("vibrate" in navigator) {
-              navigator.vibrate([200, 100, 200]);
-            }
+            break;
           }
-          break;
         }
-      }
-      setNextManeuverIdx(nextManeuverIdxRef.current);
+        setNextManeuverIdx(nextManeuverIdxRef.current);
 
-      checkArrival(newPos);
+        checkArrival(newPos);
+      }
     },
     [routeData, checkArrival]
   );
 
   const startTracking = useCallback(() => {
-    if (!routeData || !userPosition) return;
+    if (!userPosition) return;
+    if (!freeWalkRef.current && !routeData) return;
     setAppMode("tracking");
     setWalkedDistance(0);
     setTrackingTime(0);
@@ -616,8 +658,8 @@ export default function Map() {
       }
     })();
 
-    // Update route status to in_progress
-    if (routeData.id) {
+    // Update route status to in_progress (not needed for free walk, already in_progress)
+    if (!freeWalkRef.current && routeData?.id) {
       fetch(`/api/route/${routeData.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -631,6 +673,37 @@ export default function Map() {
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
     );
   }, [routeData, userPosition, handleGpsPosition]);
+
+  const startFreeWalk = async () => {
+    if (!userPosition) return;
+    setRouteError(null);
+    try {
+      const res = await fetch("/api/free-walk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat: userPosition[0], lng: userPosition[1] }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Erreur serveur");
+
+      setFreeWalk(true);
+      freeWalkRef.current = true;
+      freeWalkPathRef.current = [userPosition];
+      setFreeWalkCoords([userPosition]);
+      setRouteData({
+        id: data.id,
+        distance_m: 0,
+        duration_s: 0,
+        steps_estimate: 0,
+        geometry: { type: "LineString", coordinates: [] },
+        routes_used: 0,
+        routes_limit: 0,
+      });
+      startTracking();
+    } catch (err) {
+      setRouteError(err instanceof Error ? err.message : "Erreur lors du démarrage");
+    }
+  };
 
   const pauseTracking = () => {
     if (watchIdRef.current !== null) {
@@ -722,6 +795,10 @@ export default function Map() {
     }
   };
 
+  // A free walk route has distance_m === walked_distance_m (both set from walked distance on completion)
+  const isHistoryFreeWalk = (route: HistoryRoute) =>
+    route.walked_distance_m !== null && route.walked_distance_m > 0 && route.distance_m === route.walked_distance_m;
+
   // ─── Memoized values ───────────────────────────────────
   const navIcon = useMemo(
     () => createNavIcon(((mapRotation % 360) + 360) % 360),
@@ -737,7 +814,7 @@ export default function Map() {
   const distToNextManeuver = nextManeuver && livePosition
     ? distanceBetween(livePosition[0], livePosition[1], nextManeuver.lat, nextManeuver.lng)
     : Infinity;
-  const showTurnBanner = isTracking && nextManeuver && distToNextManeuver < 100;
+  const showTurnBanner = isTracking && !freeWalk && nextManeuver && distToNextManeuver < 100;
 
   return (
     <div className="relative h-full w-full overflow-hidden">
@@ -801,12 +878,20 @@ export default function Map() {
         <ResizeMap active={isTracking} />
 
         {/* Route display */}
-        {activeGeometry && (
+        {activeGeometry && !freeWalk && (
           <>
             <GradientRoute geometry={activeGeometry} />
             <RouteArrows geometry={activeGeometry} />
             {!isTracking && <FitRouteBounds geometry={activeGeometry} />}
           </>
+        )}
+
+        {/* Free walk live trace */}
+        {freeWalk && isTracking && freeWalkCoords.length >= 2 && (
+          <Polyline
+            positions={freeWalkCoords}
+            pathOptions={{ color: "#00f5d4", weight: 4, opacity: 0.9 }}
+          />
         )}
       </MapContainer>
       </div>
@@ -842,7 +927,7 @@ export default function Map() {
       )}
 
       {/* ─── Route info panel ────────────────────────── */}
-      {routeData && !isTracking && (
+      {routeData && !isTracking && !freeWalk && (
         <div className="glass-card animate-fade-in-up absolute top-[calc(env(safe-area-inset-top,0px)+4rem)] left-1/2 z-[1000] w-[90%] max-w-sm -translate-x-1/2 px-4 py-3">
           <div className="flex items-center justify-center gap-3 font-[family-name:var(--font-montserrat)] text-sm font-semibold">
             <div className="flex flex-col items-center">
@@ -899,9 +984,13 @@ export default function Map() {
             <div className="h-10 w-px bg-dark-border" />
             <div className="flex flex-col items-center">
               <span className="text-xl font-bold text-accent-cyan">
-                {(remainingDistance / 1000).toFixed(2)}
+                {freeWalk
+                  ? Math.round(walkedDistance / 0.75).toLocaleString()
+                  : (remainingDistance / 1000).toFixed(2)}
               </span>
-              <span className="text-[10px] text-text-muted">km restants</span>
+              <span className="text-[10px] text-text-muted">
+                {freeWalk ? "pas" : "km restants"}
+              </span>
             </div>
           </div>
           <div className="flex gap-3">
@@ -920,12 +1009,21 @@ export default function Map() {
                 Reprendre
               </button>
             )}
-            <button
-              onClick={() => stopTracking("abandoned")}
-              className="flex-1 rounded-xl bg-accent-red/20 py-3 text-sm font-bold text-accent-red transition-all active:scale-95"
-            >
-              Arrêter
-            </button>
+            {freeWalk ? (
+              <button
+                onClick={() => stopTracking("completed")}
+                className="flex-1 rounded-xl bg-accent-green/20 py-3 text-sm font-bold text-accent-green transition-all active:scale-95"
+              >
+                Terminer
+              </button>
+            ) : (
+              <button
+                onClick={() => stopTracking("abandoned")}
+                className="flex-1 rounded-xl bg-accent-red/20 py-3 text-sm font-bold text-accent-red transition-all active:scale-95"
+              >
+                Arrêter
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -1039,7 +1137,9 @@ export default function Map() {
               className={`animate-fade-in-up flex items-center justify-center gap-2 rounded-xl py-3.5 text-base font-bold transition-all active:scale-[0.98] disabled:opacity-50 ${
                 appMode === "route_shown" && !viewingHistory
                   ? "border border-dark-border bg-dark-card px-5 text-text-secondary"
-                  : "btn-gradient flex-1"
+                  : appMode === "positioned"
+                    ? "flex-1 btn-gradient"
+                    : "btn-gradient flex-1"
               }`}
             >
               {(appMode === "locating" || appMode === "generating") && (
@@ -1055,12 +1155,21 @@ export default function Map() {
                       ? "Générer un parcours"
                       : "Nouveau parcours"}
             </button>
+            {appMode === "positioned" && (
+              <button
+                onClick={startFreeWalk}
+                className="animate-fade-in-up flex items-center justify-center gap-2 rounded-xl border border-accent-cyan/30 bg-accent-cyan/10 px-5 py-3.5 text-base font-bold text-accent-cyan transition-all active:scale-[0.98]"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                Parcours libre
+              </button>
+            )}
           </div>
         </div>
       )}
 
       {/* ─── Route legend ────────────────────────────── */}
-      {routeData && !isTracking && (
+      {routeData && !isTracking && !freeWalk && (
         <div className="glass-card absolute bottom-28 left-4 z-[1000] px-3 py-2">
           <div className="flex items-center gap-2 text-xs">
             <span className="font-medium text-accent-cyan">Départ</span>
@@ -1170,12 +1279,14 @@ export default function Map() {
                           Voir sur la carte
                         </button>
                       )}
-                      <button
-                        onClick={() => redoRoute(route)}
-                        className="flex-1 rounded-lg bg-accent-cyan/10 py-1.5 text-xs font-semibold text-accent-cyan transition-colors hover:bg-accent-cyan/20"
-                      >
-                        Refaire
-                      </button>
+                      {!isHistoryFreeWalk(route) && (
+                        <button
+                          onClick={() => redoRoute(route)}
+                          className="flex-1 rounded-lg bg-accent-cyan/10 py-1.5 text-xs font-semibold text-accent-cyan transition-colors hover:bg-accent-cyan/20"
+                        >
+                          Refaire
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}

@@ -1,8 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseClient } from "@/lib/api-supabase";
 
-const MAX_BODY_SIZE = 1024; // 1 KB
-const ALLOWED_FIELDS = new Set(["status", "walked_distance_m", "walked_duration_s"]);
+const MAX_BODY_SIZE = 512_000; // 512 KB (geometry can be large)
+const ALLOWED_FIELDS = new Set([
+  "status",
+  "walked_distance_m",
+  "walked_duration_s",
+  "geometry",
+  "distance_m",
+  "steps_estimate",
+  "duration_s",
+]);
 
 export async function PATCH(
   request: NextRequest,
@@ -76,7 +84,7 @@ export async function PATCH(
       );
     }
 
-    const { status, walked_distance_m, walked_duration_s } = body;
+    const { status, walked_distance_m, walked_duration_s, geometry, distance_m, steps_estimate, duration_s } = body;
 
     const validStatuses = ["in_progress", "completed", "abandoned"];
     if (status && !validStatuses.includes(status as string)) {
@@ -106,6 +114,52 @@ export async function PATCH(
       }
       updateData.walked_duration_s = Math.round(walked_duration_s);
     }
+    // Validate geometry (GeoJSON LineString)
+    if (geometry !== undefined) {
+      if (
+        typeof geometry !== "object" ||
+        geometry === null ||
+        (geometry as Record<string, unknown>).type !== "LineString" ||
+        !Array.isArray((geometry as Record<string, unknown>).coordinates)
+      ) {
+        return NextResponse.json(
+          { error: "geometry doit être un GeoJSON LineString valide" },
+          { status: 400 }
+        );
+      }
+      updateData.geometry = geometry;
+    }
+
+    if (typeof distance_m === "number") {
+      if (distance_m < 0 || isNaN(distance_m)) {
+        return NextResponse.json(
+          { error: "distance_m doit être un nombre positif" },
+          { status: 400 }
+        );
+      }
+      updateData.distance_m = Math.round(distance_m);
+    }
+
+    if (typeof steps_estimate === "number") {
+      if (steps_estimate < 0 || isNaN(steps_estimate)) {
+        return NextResponse.json(
+          { error: "steps_estimate doit être un nombre positif" },
+          { status: 400 }
+        );
+      }
+      updateData.steps_estimate = Math.round(steps_estimate);
+    }
+
+    if (typeof duration_s === "number") {
+      if (duration_s < 0 || isNaN(duration_s)) {
+        return NextResponse.json(
+          { error: "duration_s doit être un nombre positif" },
+          { status: 400 }
+        );
+      }
+      updateData.duration_s = Math.round(duration_s);
+    }
+
     if (status === "completed") updateData.completed_at = new Date().toISOString();
 
     const { error } = await supabase
