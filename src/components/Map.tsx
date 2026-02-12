@@ -315,6 +315,7 @@ export default function Map() {
   const [routeError, setRouteError] = useState<string | null>(null);
   const [limitReached, setLimitReached] = useState(false);
   const [targetSteps, setTargetSteps] = useState(10000);
+  const [showStepSlider, setShowStepSlider] = useState(false);
 
   // Free walk state
   const [freeWalk, setFreeWalk] = useState(false);
@@ -456,6 +457,7 @@ export default function Map() {
   const generateRoute = async () => {
     if (!userPosition) return;
     setAppMode("generating");
+    setShowStepSlider(false);
     setRouteError(null);
     setRouteData(null);
     setLimitReached(false);
@@ -784,7 +786,11 @@ export default function Map() {
     if (appMode === "idle") {
       requestLocation();
     } else if (appMode === "positioned") {
-      generateRoute();
+      if (showStepSlider) {
+        generateRoute();
+      } else {
+        setShowStepSlider(true);
+      }
     } else if (appMode === "route_shown" && !viewingHistory) {
       generateRoute();
     } else if (appMode === "route_shown" && viewingHistory) {
@@ -1093,7 +1099,8 @@ export default function Map() {
       {/* ─── Bottom action bar ────────────────────────── */}
       {!limitReached && !isTracking && !showCongrats && (
         <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[1000] bg-gradient-to-t from-dark-base via-dark-base/60 to-transparent px-4 pb-[max(0.75rem,env(safe-area-inset-bottom,0px))] pt-12">
-          {appMode === "positioned" && (
+          {/* Step slider (only after user chose "Générer un parcours") */}
+          {appMode === "positioned" && showStepSlider && (
             <div className="pointer-events-auto mb-5">
               <div className="mb-3 text-center">
                 <span className="font-[family-name:var(--font-montserrat)] text-3xl font-extrabold text-accent-cyan">
@@ -1131,15 +1138,14 @@ export default function Map() {
                 Démarrer
               </button>
             )}
+            {/* Main action button */}
             <button
               onClick={handleMainAction}
               disabled={appMode === "locating" || appMode === "generating"}
               className={`animate-fade-in-up flex items-center justify-center gap-2 rounded-xl py-3.5 text-base font-bold transition-all active:scale-[0.98] disabled:opacity-50 ${
                 appMode === "route_shown" && !viewingHistory
                   ? "border border-dark-border bg-dark-card px-5 text-text-secondary"
-                  : appMode === "positioned"
-                    ? "flex-1 btn-gradient"
-                    : "btn-gradient flex-1"
+                  : "btn-gradient flex-1"
               }`}
             >
               {(appMode === "locating" || appMode === "generating") && (
@@ -1151,17 +1157,29 @@ export default function Map() {
                   ? "Localisation..."
                   : appMode === "generating"
                     ? "Génération..."
-                    : appMode === "positioned"
-                      ? "Générer un parcours"
-                      : "Nouveau parcours"}
+                    : appMode === "positioned" && showStepSlider
+                      ? "Générer"
+                      : appMode === "positioned"
+                        ? "Générer un parcours"
+                        : "Nouveau parcours"}
             </button>
-            {appMode === "positioned" && (
+            {/* Free walk button — only in choice screen (before slider) */}
+            {appMode === "positioned" && !showStepSlider && (
               <button
                 onClick={startFreeWalk}
-                className="animate-fade-in-up flex items-center justify-center gap-2 rounded-xl border border-accent-cyan/30 bg-accent-cyan/10 px-5 py-3.5 text-base font-bold text-accent-cyan transition-all active:scale-[0.98]"
+                className="animate-fade-in-up flex flex-1 items-center justify-center gap-2 rounded-xl border border-accent-cyan/30 bg-accent-cyan/10 py-3.5 text-base font-bold text-accent-cyan transition-all active:scale-[0.98]"
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
                 Parcours libre
+              </button>
+            )}
+            {/* Back button — when slider is shown */}
+            {appMode === "positioned" && showStepSlider && (
+              <button
+                onClick={() => setShowStepSlider(false)}
+                className="animate-fade-in-up flex items-center justify-center rounded-xl border border-dark-border bg-dark-card px-5 py-3.5 text-sm font-bold text-text-secondary transition-all active:scale-[0.98]"
+              >
+                Retour
               </button>
             )}
           </div>

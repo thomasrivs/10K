@@ -4,7 +4,9 @@ const OSRM_BASE_URL = "https://router.project-osrm.org";
 const MAX_WAYPOINT_RETRIES = 3;
 
 const CUL_DE_SAC_THRESHOLD_M = 10; // Max 10m of retracing allowed
-const MAX_ATTEMPTS = 20;
+const MAX_ATTEMPTS = 30;
+const STEP_TOLERANCE = 500; // ±500 steps accuracy target
+const DISTANCE_TOLERANCE_M = STEP_TOLERANCE * 0.75; // ±375m
 
 export interface TurnManeuver {
   lat: number;
@@ -407,8 +409,8 @@ export async function generateRoute(
   targetSteps: number = 10000
 ): Promise<RouteResult> {
   const targetDistanceM = targetSteps * 0.75;
-  const minDistanceM = targetDistanceM * 0.9;
-  const maxDistanceM = targetDistanceM * 1.1;
+  const minDistanceM = targetDistanceM - DISTANCE_TOLERANCE_M;
+  const maxDistanceM = targetDistanceM + DISTANCE_TOLERANCE_M;
   const numWaypoints = Math.max(3, Math.min(8, Math.round(targetDistanceM / 1500)));
   let radiusKm = 1.2 * (targetDistanceM / 7500);
   let bestAny: CandidateRoute | null = null; // best route overall (fallback)
@@ -464,13 +466,25 @@ export async function generateRoute(
     }
   }
 
-  // Fallback: return best route found (may not be perfect)
+  // Fallback: return best route found if within acceptable range
   if (bestAny) {
+    const fallbackSteps = Math.round(bestAny.distance / 0.75);
+    if (Math.abs(fallbackSteps - targetSteps) > STEP_TOLERANCE) {
+      throw new Error(
+        "Impossible de générer un parcours adapté à cette distance. Essayez un autre nombre de pas."
+      );
+    }
     return buildResult(bestAny.distance, bestAny.geometry, bestAny.waypoints, bestAny.maneuvers);
   }
 
   // Ultimate fallback
   const waypoints = generateSafeWaypoints(lat, lng, radiusKm, numWaypoints);
   const result = await callOSRM([lat, lng], waypoints);
+  const ultimateSteps = Math.round(result.distance / 0.75);
+  if (Math.abs(ultimateSteps - targetSteps) > STEP_TOLERANCE) {
+    throw new Error(
+      "Impossible de générer un parcours adapté à cette distance. Essayez un autre nombre de pas."
+    );
+  }
   return buildResult(result.distance, result.geometry, waypoints, result.maneuvers);
 }
