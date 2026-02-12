@@ -1,33 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createServerClient } from "@supabase/ssr";
+import { getSupabaseClient } from "@/lib/api-supabase";
 import { generateRoute } from "@/lib/route-generator";
 
 const FREE_ROUTE_LIMIT = 5;
 const RATE_LIMIT_SECONDS = 30;
 const MAX_BODY_SIZE = 1024; // 1 KB
-
-async function getSupabaseClient(request: NextRequest) {
-  const response = NextResponse.next({ request });
-
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll();
-        },
-        setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value, options }) =>
-            response.cookies.set(name, value, options)
-          );
-        },
-      },
-    }
-  );
-
-  return { supabase, response };
-}
 
 export async function POST(request: NextRequest) {
   try {
@@ -135,9 +112,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const { lat, lng } = body as Record<string, unknown>;
+    const { lat, lng, targetSteps } = body as Record<string, unknown>;
 
-    if (typeof lat !== "number" || typeof lng !== "number") {
+    if (typeof lat !== "number" || typeof lng !== "number" || isNaN(lat) || isNaN(lng)) {
       return NextResponse.json(
         { error: "lat et lng sont requis (nombres)" },
         { status: 400 }
@@ -151,8 +128,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const steps = typeof targetSteps === "number" && targetSteps >= 2000 && targetSteps <= 15000
+      ? Math.round(targetSteps / 1000) * 1000
+      : 10000;
+
     // Generate route
-    const route = await generateRoute(lat, lng);
+    const route = await generateRoute(lat, lng, steps);
 
     // Save to DB (with geometry + duration + status)
     const { data: insertedRoute, error: insertError } = await supabase
@@ -172,6 +153,10 @@ export async function POST(request: NextRequest) {
 
     if (insertError) {
       console.error("Insert error:", insertError);
+      return NextResponse.json(
+        { error: "Erreur lors de la sauvegarde du parcours" },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json({

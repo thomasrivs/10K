@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -300,6 +300,10 @@ function statusBadge(status: string) {
   );
 }
 
+// ─── Module-level singletons ────────────────────────────────
+
+const supabase = createClient();
+
 // ─── Main Component ──────────────────────────────────────────
 
 export default function Map() {
@@ -332,8 +336,8 @@ export default function Map() {
   const [historyRoutes, setHistoryRoutes] = useState<HistoryRoute[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [viewingHistory, setViewingHistory] = useState<HistoryRoute | null>(null);
+  const pendingRegenerateRef = useRef(false);
 
-  const supabase = createClient();
   const router = useRouter();
 
   // ─── Cleanup on unmount ─────────────────────────────────
@@ -347,23 +351,14 @@ export default function Map() {
   // ─── Tracking timer ─────────────────────────────────────
   useEffect(() => {
     if (appMode === "tracking") {
-      timerRef.current = setInterval(() => {
-        setTrackingTime((t) => t + 1);
-      }, 1000);
-    } else if (appMode !== "paused") {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
+      timerRef.current = setInterval(() => setTrackingTime((t) => t + 1), 1000);
+      return () => {
+        if (timerRef.current) {
+          clearInterval(timerRef.current);
+          timerRef.current = null;
+        }
+      };
     }
-    // Pause: just stop the interval, keep the time
-    if (appMode === "paused" && timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
   }, [appMode]);
 
   // ─── Compass heading for map rotation ───────────────────
@@ -486,6 +481,38 @@ export default function Map() {
   };
 
   // ─── GPS Tracking ──────────────────────────────────────
+
+  const stopTracking = useCallback(
+    (status: "completed" | "abandoned") => {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      if ("speechSynthesis" in window) speechSynthesis.cancel();
+      if ("vibrate" in navigator) navigator.vibrate(0);
+
+      // Save to DB
+      if (routeData?.id) {
+        fetch(`/api/route/${routeData.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            status,
+            walked_distance_m: walkedDistance,
+            walked_duration_s: trackingTime,
+          }),
+        }).catch(() => {});
+      }
+
+      setAppMode("route_shown");
+    },
+    [routeData, walkedDistance, trackingTime]
+  );
+
   const checkArrival = useCallback(
     (pos: [number, number]) => {
       if (!userPosition || !routeData) return;
@@ -495,7 +522,70 @@ export default function Map() {
         setShowCongrats(true);
       }
     },
-    [userPosition, routeData, walkedDistance]
+    [userPosition, routeData, walkedDistance, stopTracking]
+  );
+
+  const handleGpsPosition = useCallback(
+    (pos: GeolocationPosition) => {
+      const newPos: [number, number] = [pos.coords.latitude, pos.coords.longitude];
+      setGpsLost(false);
+      setLivePosition(newPos);
+      if (lastPosRef.current) {
+        const d = distanceBetween(
+          lastPosRef.current[0], lastPosRef.current[1],
+          newPos[0], newPos[1]
+        );
+        if (d > 3 && d < 100) {
+          setWalkedDistance((prev) => prev + d);
+          if (!compassActiveRef.current) {
+            let h = pos.coords.heading;
+            if (h === null || h === undefined || isNaN(h)) {
+              h = bearing(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
+            }
+            if (typeof h === "number" && !isNaN(h)) {
+              setMapRotation((prev) => {
+                const prevMod = ((prev % 360) + 360) % 360;
+                let delta = h - prevMod;
+                if (delta > 180) delta -= 360;
+                if (delta < -180) delta += 360;
+                return prev + delta;
+              });
+            }
+          }
+        }
+      }
+      lastPosRef.current = newPos;
+
+      // Turn-by-turn maneuver tracking
+      const mnvs = routeData?.maneuvers ?? [];
+      while (nextManeuverIdxRef.current < mnvs.length) {
+        const m = mnvs[nextManeuverIdxRef.current];
+        const dm = distanceBetween(newPos[0], newPos[1], m.lat, m.lng);
+        if (dm < 25) {
+          nextManeuverIdxRef.current++;
+        } else {
+          if (dm < 80 && lastAnnouncedRef.current !== nextManeuverIdxRef.current) {
+            lastAnnouncedRef.current = nextManeuverIdxRef.current;
+            if ("speechSynthesis" in window) {
+              const u = new SpeechSynthesisUtterance(
+                `Dans ${Math.round(dm)} mètres, ${m.instruction.toLowerCase()}`
+              );
+              u.lang = "fr-FR";
+              u.rate = 1.1;
+              speechSynthesis.speak(u);
+            }
+            if ("vibrate" in navigator) {
+              navigator.vibrate([200, 100, 200]);
+            }
+          }
+          break;
+        }
+      }
+      setNextManeuverIdx(nextManeuverIdxRef.current);
+
+      checkArrival(newPos);
+    },
+    [routeData, checkArrival]
   );
 
   const startTracking = useCallback(() => {
@@ -536,67 +626,11 @@ export default function Map() {
     }
 
     watchIdRef.current = navigator.geolocation.watchPosition(
-      (pos) => {
-        const newPos: [number, number] = [pos.coords.latitude, pos.coords.longitude];
-        setGpsLost(false);
-        setLivePosition(newPos);
-        if (lastPosRef.current) {
-          const d = distanceBetween(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
-          if (d > 3 && d < 100) {
-            setWalkedDistance((prev) => prev + d);
-            // Heading from movement (fallback when compass not available)
-            if (!compassActiveRef.current) {
-              let h = pos.coords.heading;
-              if (h === null || h === undefined || isNaN(h)) {
-                h = bearing(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
-              }
-              if (typeof h === "number" && !isNaN(h)) {
-                setMapRotation((prev) => {
-                  const prevMod = ((prev % 360) + 360) % 360;
-                  let delta = h - prevMod;
-                  if (delta > 180) delta -= 360;
-                  if (delta < -180) delta += 360;
-                  return prev + delta;
-                });
-              }
-            }
-          }
-        }
-        lastPosRef.current = newPos;
-
-        // Turn-by-turn maneuver tracking
-        const mnvs = routeData?.maneuvers ?? [];
-        while (nextManeuverIdxRef.current < mnvs.length) {
-          const m = mnvs[nextManeuverIdxRef.current];
-          const dm = distanceBetween(newPos[0], newPos[1], m.lat, m.lng);
-          if (dm < 25) {
-            nextManeuverIdxRef.current++;
-          } else {
-            if (dm < 80 && lastAnnouncedRef.current !== nextManeuverIdxRef.current) {
-              lastAnnouncedRef.current = nextManeuverIdxRef.current;
-              if ("speechSynthesis" in window) {
-                const u = new SpeechSynthesisUtterance(
-                  `Dans ${Math.round(dm)} mètres, ${m.instruction.toLowerCase()}`
-                );
-                u.lang = "fr-FR";
-                u.rate = 1.1;
-                speechSynthesis.speak(u);
-              }
-              if ("vibrate" in navigator) {
-                navigator.vibrate([200, 100, 200]);
-              }
-            }
-            break;
-          }
-        }
-        setNextManeuverIdx(nextManeuverIdxRef.current);
-
-        checkArrival(newPos);
-      },
+      handleGpsPosition,
       () => setGpsLost(true),
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
     );
-  }, [routeData, userPosition, checkArrival]);
+  }, [routeData, userPosition, handleGpsPosition]);
 
   const pauseTracking = () => {
     if (watchIdRef.current !== null) {
@@ -607,97 +641,17 @@ export default function Map() {
   };
 
   const resumeTracking = () => {
+    if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
     setAppMode("tracking");
     watchIdRef.current = navigator.geolocation.watchPosition(
-      (pos) => {
-        const newPos: [number, number] = [pos.coords.latitude, pos.coords.longitude];
-        setGpsLost(false);
-        setLivePosition(newPos);
-        if (lastPosRef.current) {
-          const d = distanceBetween(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
-          if (d > 3 && d < 100) {
-            setWalkedDistance((prev) => prev + d);
-            if (!compassActiveRef.current) {
-              let h = pos.coords.heading;
-              if (h === null || h === undefined || isNaN(h)) {
-                h = bearing(lastPosRef.current[0], lastPosRef.current[1], newPos[0], newPos[1]);
-              }
-              if (typeof h === "number" && !isNaN(h)) {
-                setMapRotation((prev) => {
-                  const prevMod = ((prev % 360) + 360) % 360;
-                  let delta = h - prevMod;
-                  if (delta > 180) delta -= 360;
-                  if (delta < -180) delta += 360;
-                  return prev + delta;
-                });
-              }
-            }
-          }
-        }
-        lastPosRef.current = newPos;
-
-        // Turn-by-turn maneuver tracking
-        const mnvs = routeData?.maneuvers ?? [];
-        while (nextManeuverIdxRef.current < mnvs.length) {
-          const m = mnvs[nextManeuverIdxRef.current];
-          const dm = distanceBetween(newPos[0], newPos[1], m.lat, m.lng);
-          if (dm < 25) {
-            nextManeuverIdxRef.current++;
-          } else {
-            if (dm < 80 && lastAnnouncedRef.current !== nextManeuverIdxRef.current) {
-              lastAnnouncedRef.current = nextManeuverIdxRef.current;
-              if ("speechSynthesis" in window) {
-                const u = new SpeechSynthesisUtterance(
-                  `Dans ${Math.round(dm)} mètres, ${m.instruction.toLowerCase()}`
-                );
-                u.lang = "fr-FR";
-                u.rate = 1.1;
-                speechSynthesis.speak(u);
-              }
-              if ("vibrate" in navigator) {
-                navigator.vibrate([200, 100, 200]);
-              }
-            }
-            break;
-          }
-        }
-        setNextManeuverIdx(nextManeuverIdxRef.current);
-
-        checkArrival(newPos);
-      },
+      handleGpsPosition,
       () => setGpsLost(true),
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
     );
   };
-
-  const stopTracking = useCallback(
-    (status: "completed" | "abandoned") => {
-      if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-        watchIdRef.current = null;
-      }
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-
-      // Save to DB
-      if (routeData?.id) {
-        fetch(`/api/route/${routeData.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            status,
-            walked_distance_m: walkedDistance,
-            walked_duration_s: trackingTime,
-          }),
-        }).catch(() => {});
-      }
-
-      setAppMode("route_shown");
-    },
-    [routeData, walkedDistance, trackingTime]
-  );
 
   // ─── History ────────────────────────────────────────────
   const loadHistory = async () => {
@@ -740,9 +694,17 @@ export default function Map() {
     setShowHistory(false);
     setViewingHistory(null);
     setUserPosition([route.start_lat, route.start_lng]);
+    pendingRegenerateRef.current = true;
     setAppMode("positioned");
-    setTimeout(() => generateRoute(), 100);
   };
+
+  // Trigger route generation after state settles from redoRoute
+  useEffect(() => {
+    if (appMode === "positioned" && pendingRegenerateRef.current) {
+      pendingRegenerateRef.current = false;
+      generateRoute();
+    }
+  }, [appMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Main action handler ───────────────────────────────
   const handleMainAction = () => {
@@ -759,6 +721,12 @@ export default function Map() {
       setAppMode("idle");
     }
   };
+
+  // ─── Memoized values ───────────────────────────────────
+  const navIcon = useMemo(
+    () => createNavIcon(((mapRotation % 360) + 360) % 360),
+    [Math.round(mapRotation)] // eslint-disable-line react-hooks/exhaustive-deps
+  );
 
   // ─── Computed values ───────────────────────────────────
   const isTracking = appMode === "tracking" || appMode === "paused";
@@ -827,7 +795,7 @@ export default function Map() {
 
         {/* Live tracking marker with direction arrow */}
         {isTracking && livePosition && (
-          <Marker position={livePosition} icon={createNavIcon(((mapRotation % 360) + 360) % 360)} />
+          <Marker position={livePosition} icon={navIcon} />
         )}
 
         <ResizeMap active={isTracking} />
