@@ -337,6 +337,7 @@ export default function Map() {
   const watchIdRef = useRef<number | null>(null);
   const lastPosRef = useRef<[number, number] | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
 
   // History state
   const [showHistory, setShowHistory] = useState(false);
@@ -347,11 +348,45 @@ export default function Map() {
 
   const router = useRouter();
 
+  // ─── Wake Lock (keep screen on during tracking) ────────
+  const requestWakeLock = useCallback(async () => {
+    if ("wakeLock" in navigator) {
+      try {
+        wakeLockRef.current = await navigator.wakeLock.request("screen");
+      } catch {
+        // Wake lock request failed (e.g. low battery)
+      }
+    }
+  }, []);
+
+  const releaseWakeLock = useCallback(() => {
+    if (wakeLockRef.current) {
+      wakeLockRef.current.release().catch(() => {});
+      wakeLockRef.current = null;
+    }
+  }, []);
+
+  // Re-acquire wake lock when user returns to the app (tab becomes visible)
+  useEffect(() => {
+    const active = appMode === "tracking" || appMode === "paused";
+    if (!active) return;
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        requestWakeLock();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [appMode, requestWakeLock]);
+
   // ─── Cleanup on unmount ─────────────────────────────────
   useEffect(() => {
     return () => {
       if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current);
       if (timerRef.current) clearInterval(timerRef.current);
+      if (wakeLockRef.current) wakeLockRef.current.release().catch(() => {});
     };
   }, []);
 
@@ -502,6 +537,7 @@ export default function Map() {
       }
       if ("speechSynthesis" in window) speechSynthesis.cancel();
       if ("vibrate" in navigator) navigator.vibrate(0);
+      releaseWakeLock();
 
       const isFreeWalk = freeWalkRef.current;
 
@@ -543,7 +579,7 @@ export default function Map() {
         setAppMode("route_shown");
       }
     },
-    [routeData, walkedDistance, trackingTime]
+    [routeData, walkedDistance, trackingTime, releaseWakeLock]
   );
 
   const checkArrival = useCallback(
@@ -645,6 +681,9 @@ export default function Map() {
     lastPosRef.current = userPosition;
     setLivePosition(userPosition);
 
+    // Keep screen on during tracking
+    requestWakeLock();
+
     // Request compass permission (must be inside user gesture for iOS)
     (async () => {
       const DOE = DeviceOrientationEvent as any;
@@ -674,7 +713,7 @@ export default function Map() {
       () => setGpsLost(true),
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
     );
-  }, [routeData, userPosition, handleGpsPosition]);
+  }, [routeData, userPosition, handleGpsPosition, requestWakeLock]);
 
   const startFreeWalk = async () => {
     if (!userPosition) return;
