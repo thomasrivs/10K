@@ -8,8 +8,8 @@ export default function manifest(): MetadataRoute.Manifest {
       "Générez un parcours de marche de 10 000 pas à partir de votre position",
     start_url: "/",
     display: "standalone",
-    background_color: "#1a1a2e",
-    theme_color: "#1a1a2e",
+    background_color: "#0a0a0a",
+    theme_color: "#0a0a0a",
     orientation: "portrait",
     icons: [
       {

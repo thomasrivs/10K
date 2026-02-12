@@ -14,6 +14,13 @@ import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { createClient } from "@/lib/supabase";
 import { useRouter } from "next/navigation";
+import {
+  isNativePlatform,
+  startPedometer,
+  stopPedometer,
+  startWatchPosition,
+  stopWatchPosition,
+} from "@/lib/native";
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -70,8 +77,8 @@ interface HistoryRoute {
 
 const startIcon = new L.DivIcon({
   html: `<div style="position:relative;width:22px;height:22px">
-    <div style="position:absolute;inset:0;background:#00f5d4;border-radius:50%;opacity:0.3;animation:pulse-ring 1.5s cubic-bezier(0.215,0.61,0.355,1) infinite"></div>
-    <div style="position:absolute;inset:3px;background:#00f5d4;border-radius:50%;border:3px solid #1a1a2e;box-shadow:0 0 12px rgba(0,245,212,0.5)"></div>
+    <div style="position:absolute;inset:0;background:#9DFC29;border-radius:50%;opacity:0.3;animation:pulse-ring 1.5s cubic-bezier(0.215,0.61,0.355,1) infinite"></div>
+    <div style="position:absolute;inset:3px;background:#9DFC29;border-radius:50%;border:3px solid #0a0a0a;box-shadow:0 0 12px rgba(157,252,41,0.5)"></div>
   </div>`,
   iconSize: [22, 22],
   iconAnchor: [11, 11],
@@ -81,9 +88,9 @@ const startIcon = new L.DivIcon({
 function createNavIcon(heading: number): L.DivIcon {
   return new L.DivIcon({
     html: `<div style="position:relative;width:44px;height:44px;transform:rotate(${heading}deg)">
-      <div style="position:absolute;inset:0;background:rgba(0,245,212,0.15);border-radius:50%;animation:pulse-ring 2s ease-out infinite"></div>
+      <div style="position:absolute;inset:0;background:rgba(157,252,41,0.15);border-radius:50%;animation:pulse-ring 2s ease-out infinite"></div>
       <svg style="position:absolute;inset:2px" width="40" height="40" viewBox="0 0 40 40">
-        <polygon points="20,4 30,32 20,25 10,32" fill="#00f5d4" stroke="#1a1a2e" stroke-width="2" stroke-linejoin="round" style="filter:drop-shadow(0 0 6px rgba(0,245,212,0.5))"/>
+        <polygon points="20,4 30,32 20,25 10,32" fill="#9DFC29" stroke="#0a0a0a" stroke-width="2" stroke-linejoin="round" style="filter:drop-shadow(0 0 6px rgba(157,252,41,0.5))"/>
       </svg>
     </div>`,
     iconSize: [44, 44],
@@ -155,8 +162,8 @@ function GradientRoute({ geometry }: { geometry: GeoJSON.LineString }) {
       .slice(i, end)
       .map((c) => [c[1], c[0]] as [number, number]);
     const t = i / Math.max(1, coords.length - 1);
-    // Cyan (hue 170) → Red (0) - vibrant on dark background
-    const hue = 170 * (1 - t);
+    // Neon green (hue 80) → Red (0) - vibrant on dark background
+    const hue = 80 * (1 - t);
     const sat = 90;
     const light = 55;
     segments.push({
@@ -212,7 +219,7 @@ function RouteArrows({ geometry }: { geometry: GeoJSON.LineString }) {
     const next = coords[Math.min(i + 1, coords.length - 1)];
     const angle = bearing(prev[1], prev[0], next[1], next[0]);
     const t = i / (coords.length - 1);
-    const hue = 170 * (1 - t);
+    const hue = 80 * (1 - t);
     arrows.push({
       position: [prev[1], prev[0]],
       angle,
@@ -229,7 +236,7 @@ function RouteArrows({ geometry }: { geometry: GeoJSON.LineString }) {
           interactive={false}
           icon={
             new L.DivIcon({
-              html: `<svg width="22" height="22" viewBox="0 0 22 22" style="transform:rotate(${a.angle}deg);filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6))"><polygon points="11,2 20,18 11,13 2,18" fill="${a.color}" stroke="#1a1a2e" stroke-width="1.5"/></svg>`,
+              html: `<svg width="22" height="22" viewBox="0 0 22 22" style="transform:rotate(${a.angle}deg);filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6))"><polygon points="11,2 20,18 11,13 2,18" fill="${a.color}" stroke="#0a0a0a" stroke-width="1.5"/></svg>`,
               iconSize: [22, 22],
               iconAnchor: [11, 11],
               className: "",
@@ -339,6 +346,11 @@ export default function Map() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
 
+  // Native pedometer state
+  const [nativeSteps, setNativeSteps] = useState<number | null>(null);
+  const [nativeDistance, setNativeDistance] = useState<number | null>(null);
+  const pedometerActiveRef = useRef(false);
+
   // History state
   const [showHistory, setShowHistory] = useState(false);
   const [historyRoutes, setHistoryRoutes] = useState<HistoryRoute[]>([]);
@@ -384,7 +396,8 @@ export default function Map() {
   // ─── Cleanup on unmount ─────────────────────────────────
   useEffect(() => {
     return () => {
-      if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current);
+      stopWatchPosition(watchIdRef.current);
+      stopPedometer();
       if (timerRef.current) clearInterval(timerRef.current);
       if (wakeLockRef.current) wakeLockRef.current.release().catch(() => {});
     };
@@ -527,10 +540,16 @@ export default function Map() {
 
   const stopTracking = useCallback(
     (status: "completed" | "abandoned") => {
-      if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-        watchIdRef.current = null;
+      // Stop GPS watch (native or web)
+      stopWatchPosition(watchIdRef.current);
+      watchIdRef.current = null;
+
+      // Stop native pedometer
+      if (pedometerActiveRef.current) {
+        stopPedometer();
+        pedometerActiveRef.current = false;
       }
+
       if (timerRef.current) {
         clearInterval(timerRef.current);
         timerRef.current = null;
@@ -549,14 +568,18 @@ export default function Map() {
           walked_duration_s: trackingTime,
         };
 
+        // Use real hardware steps if available, otherwise estimate
+        const realSteps = nativeSteps ?? Math.round(walkedDistance / 0.75);
+        const realDistance = nativeDistance ?? walkedDistance;
+
         if (isFreeWalk) {
           const path = freeWalkPathRef.current;
           patchBody.geometry = {
             type: "LineString",
             coordinates: path.map(([lat, lng]) => [lng, lat]),
           };
-          patchBody.distance_m = Math.round(walkedDistance);
-          patchBody.steps_estimate = Math.round(walkedDistance / 0.75);
+          patchBody.distance_m = Math.round(realDistance);
+          patchBody.steps_estimate = realSteps;
           patchBody.duration_s = trackingTime;
         }
 
@@ -579,7 +602,7 @@ export default function Map() {
         setAppMode("route_shown");
       }
     },
-    [routeData, walkedDistance, trackingTime, releaseWakeLock]
+    [routeData, walkedDistance, trackingTime, nativeSteps, nativeDistance, releaseWakeLock]
   );
 
   const checkArrival = useCallback(
@@ -676,6 +699,8 @@ export default function Map() {
     setGpsLost(false);
     setMapRotation(0);
     setNextManeuverIdx(0);
+    setNativeSteps(null);
+    setNativeDistance(null);
     nextManeuverIdxRef.current = 0;
     lastAnnouncedRef.current = -1;
     lastPosRef.current = userPosition;
@@ -699,6 +724,15 @@ export default function Map() {
       }
     })();
 
+    // Start native pedometer if available (real hardware step counting)
+    (async () => {
+      const ok = await startPedometer((steps, distance) => {
+        setNativeSteps(steps);
+        setNativeDistance(distance);
+      });
+      pedometerActiveRef.current = ok;
+    })();
+
     // Update route status to in_progress (not needed for free walk, already in_progress)
     if (!freeWalkRef.current && routeData?.id) {
       fetch(`/api/route/${routeData.id}`, {
@@ -708,11 +742,20 @@ export default function Map() {
       }).catch(() => {});
     }
 
-    watchIdRef.current = navigator.geolocation.watchPosition(
-      handleGpsPosition,
-      () => setGpsLost(true),
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
-    );
+    // Start GPS — native Capacitor plugin or web fallback
+    (async () => {
+      const { webWatchId } = await startWatchPosition(
+        (lat, lng, heading) => {
+          // Build a fake GeolocationPosition-like call for handleGpsPosition
+          const pos = {
+            coords: { latitude: lat, longitude: lng, heading },
+          } as GeolocationPosition;
+          handleGpsPosition(pos);
+        },
+        () => setGpsLost(true)
+      );
+      watchIdRef.current = webWatchId;
+    })();
   }, [routeData, userPosition, handleGpsPosition, requestWakeLock]);
 
   const startFreeWalk = async () => {
@@ -747,24 +790,28 @@ export default function Map() {
   };
 
   const pauseTracking = () => {
-    if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-    }
+    stopWatchPosition(watchIdRef.current);
+    watchIdRef.current = null;
     setAppMode("paused");
   };
 
   const resumeTracking = () => {
-    if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-    }
+    stopWatchPosition(watchIdRef.current);
+    watchIdRef.current = null;
     setAppMode("tracking");
-    watchIdRef.current = navigator.geolocation.watchPosition(
-      handleGpsPosition,
-      () => setGpsLost(true),
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
-    );
+
+    (async () => {
+      const { webWatchId } = await startWatchPosition(
+        (lat, lng, heading) => {
+          const pos = {
+            coords: { latitude: lat, longitude: lng, heading },
+          } as GeolocationPosition;
+          handleGpsPosition(pos);
+        },
+        () => setGpsLost(true)
+      );
+      watchIdRef.current = webWatchId;
+    })();
   };
 
   // ─── History ────────────────────────────────────────────
@@ -853,6 +900,9 @@ export default function Map() {
   // ─── Computed values ───────────────────────────────────
   const isTracking = appMode === "tracking" || appMode === "paused";
   const remainingDistance = routeData ? Math.max(0, routeData.distance_m - walkedDistance) : 0;
+  // Use real hardware steps when available, fallback to estimation
+  const currentSteps = nativeSteps ?? Math.round(walkedDistance / 0.75);
+  const currentDistance = nativeDistance ?? walkedDistance;
   const activeGeometry = routeData?.geometry ?? viewingHistory?.geometry ?? null;
   const maneuvers = routeData?.maneuvers ?? [];
   const nextManeuver = maneuvers[nextManeuverIdx] ?? null;
@@ -898,8 +948,8 @@ export default function Map() {
             center={userPosition}
             radius={10}
             pathOptions={{
-              color: "#00f5d4",
-              fillColor: "#00f5d4",
+              color: "#9DFC29",
+              fillColor: "#9DFC29",
               fillOpacity: 0.7,
               weight: 3,
             }}
@@ -935,7 +985,7 @@ export default function Map() {
         {freeWalk && isTracking && freeWalkCoords.length >= 2 && (
           <Polyline
             positions={freeWalkCoords}
-            pathOptions={{ color: "#00f5d4", weight: 4, opacity: 0.9 }}
+            pathOptions={{ color: "#9DFC29", weight: 4, opacity: 0.9 }}
           />
         )}
       </MapContainer>
@@ -945,17 +995,17 @@ export default function Map() {
       {showTurnBanner && nextManeuver && (
         <div className="glass-card animate-fade-in-up absolute top-[calc(env(safe-area-inset-top,0px)+1rem)] left-1/2 z-[1100] flex -translate-x-1/2 items-center gap-3 px-5 py-3">
           {nextManeuver.type.includes("left") ? (
-            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="#00f5d4" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="#9DFC29" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
               <path d="M10 8L4 14L10 20"/>
               <path d="M4 14H22C24.2 14 26 15.8 26 18V28"/>
             </svg>
           ) : nextManeuver.type.includes("right") ? (
-            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="#00f5d4" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="#9DFC29" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
               <path d="M22 8L28 14L22 20"/>
               <path d="M28 14H10C7.8 14 6 15.8 6 18V28"/>
             </svg>
           ) : (
-            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="#00f5d4" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="#9DFC29" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
               <path d="M10 20L4 14L10 8"/>
               <path d="M4 14H16C20.4 14 24 17.6 24 22V28"/>
             </svg>
@@ -1015,7 +1065,7 @@ export default function Map() {
           <div className="mb-4 flex items-center justify-around font-[family-name:var(--font-montserrat)] text-sm">
             <div className="flex flex-col items-center">
               <span className="text-xl font-bold text-accent-cyan">
-                {(walkedDistance / 1000).toFixed(2)}
+                {(currentDistance / 1000).toFixed(2)}
               </span>
               <span className="text-[10px] text-text-muted">km parcourus</span>
             </div>
@@ -1030,7 +1080,7 @@ export default function Map() {
             <div className="flex flex-col items-center">
               <span className="text-xl font-bold text-accent-cyan">
                 {freeWalk
-                  ? Math.round(walkedDistance / 0.75).toLocaleString()
+                  ? currentSteps.toLocaleString()
                   : (remainingDistance / 1000).toFixed(2)}
               </span>
               <span className="text-[10px] text-text-muted">
@@ -1084,7 +1134,7 @@ export default function Map() {
             <div className="mt-4 flex justify-around">
               <div className="flex flex-col items-center">
                 <span className="font-[family-name:var(--font-montserrat)] text-lg font-bold text-text-primary">
-                  {(walkedDistance / 1000).toFixed(2)} km
+                  {(currentDistance / 1000).toFixed(2)} km
                 </span>
                 <span className="text-xs text-text-muted">distance</span>
               </div>
@@ -1096,7 +1146,7 @@ export default function Map() {
               </div>
               <div className="flex flex-col items-center">
                 <span className="font-[family-name:var(--font-montserrat)] text-lg font-bold text-text-primary">
-                  {Math.round(walkedDistance / 0.75).toLocaleString()}
+                  {currentSteps.toLocaleString()}
                 </span>
                 <span className="text-xs text-text-muted">pas</span>
               </div>
@@ -1156,7 +1206,7 @@ export default function Map() {
                 onChange={(e) => setTargetSteps(Number(e.target.value))}
                 className="w-full"
                 style={{
-                  background: `linear-gradient(to right, #00f5d4 0%, #00e676 ${((targetSteps - 2000) / 13000) * 100}%, #2a3a5c ${((targetSteps - 2000) / 13000) * 100}%, #2a3a5c 100%)`,
+                  background: `linear-gradient(to right, #9DFC29 0%, #7dd622 ${((targetSteps - 2000) / 13000) * 100}%, #2a2a2a ${((targetSteps - 2000) / 13000) * 100}%, #2a2a2a 100%)`,
                 }}
               />
               <div className="mt-2 flex justify-between px-1 text-[10px] text-text-muted">
@@ -1234,7 +1284,7 @@ export default function Map() {
               className="h-2 w-16 rounded-full"
               style={{
                 background:
-                  "linear-gradient(to right, hsl(170,90%,55%), hsl(85,90%,55%), hsl(40,90%,55%), hsl(0,90%,55%))",
+                  "linear-gradient(to right, hsl(80,95%,55%), hsl(50,90%,55%), hsl(25,90%,55%), hsl(0,90%,55%))",
               }}
             />
             <span className="font-medium text-accent-red">Arrivée</span>
