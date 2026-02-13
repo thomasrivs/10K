@@ -19,7 +19,6 @@
     "@capgo/capacitor-pedometer": "^8.0.17",
     "@supabase/ssr": "^0.8.0",
     "@supabase/supabase-js": "^2.95.3",
-    "@transistorsoft/capacitor-background-geolocation": "^8.0.1",
     "@turf/boolean-point-in-polygon": "^7.3.4",
     "@turf/helpers": "^7.3.4",
     "leaflet": "^1.9.4",
